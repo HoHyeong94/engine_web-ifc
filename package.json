@@ -19,6 +19,7 @@
   "pckg-gui": {},
   "scripts": {
     "gen-schema": "cd src/schema-generator && ts-node gen_functional_types.ts",
+    "gen-schema-rust": "cd src/schema-generator/rust && ts-node gen_functional_types.ts",
     "setup-env": "emsdk_env",
     "setup-mingw": "mingw-get instal msys-make gettext",
     "build-release": "npm run build-wasm-release && npm run build-api && npm run build-cleanup",
