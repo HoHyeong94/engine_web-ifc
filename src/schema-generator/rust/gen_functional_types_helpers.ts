@@ -179,7 +179,7 @@ export function generateStruct(entity: Entity, classBuffer: Array<string>, types
     entity.inverseProps.forEach((prop) => {
         let propType: string = prop.type;
         let typeName: string;
-        
+
         let primitive: boolean = true;
 
         if (propType == "boolean") {
@@ -195,10 +195,10 @@ export function generateStruct(entity: Entity, classBuffer: Array<string>, types
             typeName = propType;
         }
 
-        let type = prop.set ? 
-                    primitive ? 
-                    `Option<Vec<${typeName}>>` : `Option<Vec<&'a ${typeName}<'a>>>` : primitive ? 
-                    `Option<${typeName}>` : `Option<&'a ${typeName}<'a>>`;
+        let type = prop.set ?
+            primitive ?
+                `Option<Vec<${typeName}>>` : `Option<Vec<&'a ${typeName}<'a>>>` : primitive ?
+                `Option<${typeName}>` : `Option<&'a ${typeName}<'a>>`;
         let propName = prop.name.toLowerCase();
         inverseProps.push(`${propName}: ${type}`);
         inversePropsName.push(propName);
@@ -208,17 +208,17 @@ export function generateStruct(entity: Entity, classBuffer: Array<string>, types
         let isMultiDimensions = p.dimensions > 1;
         let isVec = p.set;
         let isOptional = p.optional;
-        
+
         let propName = p.name.toLowerCase();
         let typeName = (!types.some(x => x.name == p.type) || (p.primitive && p.type !== "number")) ?
             ((p.primitive && p.type === "number") ? "f64" :
                 p.type == "boolean" ? "bool" : p.type == "logical" ? "Logical" : p.type == "string" ? "String" : `&'a ${p.type}<'a>`) : `&'a ${p.type}<'a>`;
         let type = isVec && isMultiDimensions && isOptional ?
-                `Option<Vec<Vec<${typeName}>>>` : isVec && isMultiDimensions && !isOptional ? 
-                `Vec<Vec<${typeName}>>` : (isVec || isMultiDimensions) && isOptional ? 
-                `Option<Vec<${typeName}>>` : (isVec || isMultiDimensions) && !isOptional ? 
-                `Vec<${typeName}>` : !(isVec || isMultiDimensions) && isOptional ? 
-                `Option<${typeName}>` : typeName;
+            `Option<Vec<Vec<${typeName}>>>` : isVec && isMultiDimensions && !isOptional ?
+                `Vec<Vec<${typeName}>>` : (isVec || isMultiDimensions) && isOptional ?
+                    `Option<Vec<${typeName}>>` : (isVec || isMultiDimensions) && !isOptional ?
+                        `Vec<${typeName}>` : !(isVec || isMultiDimensions) && isOptional ?
+                            `Option<${typeName}>` : typeName;
         derivedProps.push(`${propName}: ${type}`);
         derivePropsName.push(propName);
 
@@ -258,7 +258,7 @@ export function generateStruct(entity: Entity, classBuffer: Array<string>, types
     classBuffer.push(`    }`);
     classBuffer.push(``);
 
-    
+
     if (!entity.parent) {
         classBuffer.push(`    impl<'a> Into<IfcLineObject<'a>> for ${entity.name}<'a> {`);
         classBuffer.push(`        fn into(self) -> IfcLineObject<'a> {`);
@@ -284,6 +284,106 @@ export function generateStruct(entity: Entity, classBuffer: Array<string>, types
         }
         classBuffer.push(`        }`);
         classBuffer.push(`    }`);
+    }
+}
+
+export function generateStructByMacro(entity: Entity, classBuffer: Array<string>, types: Type[], crcTable: any) {
+    const inverseProps: string[] = [];
+    const derivedProps: string[] = [];
+
+    let ifcRootProps: number = 0;
+    let typeNum: number = crc32(entity.name.toUpperCase(), crcTable);
+    let isifcroot: boolean = false;
+
+    entity.inverseProps.forEach((prop) => {
+        let propType: string = prop.type;
+        let typeName: string;
+
+        let primitive: boolean = true;
+
+        if (propType == "boolean") {
+            typeName = "bool";
+        } else if (propType == "logical") {
+            typeName = "Logical";
+        } else if (propType == "number") {
+            typeName = "f64";
+        } else if (propType == "string") {
+            typeName = "String"
+        } else {
+            primitive = false;
+            typeName = propType;
+        }
+
+        let type = prop.set ?
+            primitive ?
+                `Option<Vec<${typeName}>>` : `Option<Vec<&'a ${typeName}<'a>>>` : primitive ?
+                `Option<${typeName}>` : `Option<&'a ${typeName}<'a>>`;
+        let propName = prop.name.toLowerCase();
+        inverseProps.push(`${propName}: ${type}`);
+    });
+    entity.derivedProps.filter(i => !entity.ifcDerivedProps.includes(i.name)).map((p) => {
+        let isMultiDimensions = p.dimensions > 1;
+        let isVec = p.set;
+        let isOptional = p.optional;
+
+        let propName = p.name.toLowerCase();
+        let typeName = (!types.some(x => x.name == p.type) || (p.primitive && p.type !== "number")) ?
+            ((p.primitive && p.type === "number") ? "f64" :
+                p.type == "boolean" ? "bool" : p.type == "logical" ? "Logical" : p.type == "string" ? "String" : `&'a ${p.type}<'a>`) : `&'a ${p.type}<'a>`;
+        let type = isVec && isMultiDimensions && isOptional ?
+            `Option<Vec<Vec<${typeName}>>>` : isVec && isMultiDimensions && !isOptional ?
+                `Vec<Vec<${typeName}>>` : (isVec || isMultiDimensions) && isOptional ?
+                    `Option<Vec<${typeName}>>` : (isVec || isMultiDimensions) && !isOptional ?
+                        `Vec<${typeName}>` : !(isVec || isMultiDimensions) && isOptional ?
+                            `Option<${typeName}>` : typeName;
+        derivedProps.push(`${propName}: ${type}`);
+
+        if (propName === "name" || propName === "description" || propName === "globalid" || propName === "ownerhistory") {
+            ifcRootProps += 1;
+        }
+    });
+
+    //isifcRoot
+    if (ifcRootProps === 4) {
+        isifcroot = true;
+    } else {
+        isifcroot = false;
+    }
+
+    let parent = !entity.parent ? "IfcLineObject" : entity.parent;
+    var nonLocalProps = entity.derivedProps.filter(n => !entity.props.includes(n));
+    let isExistNew = nonLocalProps.some((p) =>
+        generateSuperAssignment(p, entity.ifcDerivedProps, types).toLowerCase().startsWith("new")
+    );
+
+    if (!entity.parent) {
+        classBuffer.push(`ifc_classes_type_noparent!(`);
+        classBuffer.push(`    ${entity.name}<'a>,`);
+        classBuffer.push(`    ${typeNum},`);
+        classBuffer.push(`    [${inverseProps.join(", ")}],`);
+        classBuffer.push(`    [${derivedProps.join(", ")}],`);
+        classBuffer.push(`    ${isifcroot},`);
+        classBuffer.push(`);`);
+    } else if (isExistNew) {
+        classBuffer.push(`ifc_classes_type_todo!(`);
+        classBuffer.push(`    ${entity.name}<'a>,`);
+        classBuffer.push(`    ${typeNum},`);
+        classBuffer.push(`    [${inverseProps.join(", ")}],`);
+        classBuffer.push(`    [${derivedProps.join(", ")}],`);
+        classBuffer.push(`    ${isifcroot},`);
+        classBuffer.push(`    ${parent}<'a>,`);
+        classBuffer.push(`);`);
+    } else {
+        classBuffer.push(`ifc_classes_type!(`);
+        classBuffer.push(`    ${entity.name}<'a>,`);
+        classBuffer.push(`    ${typeNum},`);
+        classBuffer.push(`    [${inverseProps.join(", ")}],`);
+        classBuffer.push(`    [${derivedProps.join(", ")}],`);
+        classBuffer.push(`    ${isifcroot},`);
+        classBuffer.push(`    ${parent}<'a>,`);
+        classBuffer.push(`    [${!isExistNew ? nonLocalProps.map((p) => `${generateSuperAssignment(p, entity.ifcDerivedProps, types).toLowerCase()}`).join(", ") : ""}],`);
+        classBuffer.push(`    ${isExistNew}`);
+        classBuffer.push(`);`);
     }
 }
 
