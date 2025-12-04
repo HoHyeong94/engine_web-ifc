@@ -304,7 +304,7 @@ export function generateStructByMacro(entity: Entity, classBuffer: Array<string>
         if (propType == "boolean") {
             typeName = "bool";
         } else if (propType == "logical") {
-            typeName = "Logical";
+            typeName = "IfcEnum";
         } else if (propType == "number") {
             typeName = "f64";
         } else if (propType == "string") {
@@ -329,7 +329,7 @@ export function generateStructByMacro(entity: Entity, classBuffer: Array<string>
         let propName = p.name.toLowerCase();
         let typeName = (!types.some(x => x.name == p.type) || (p.primitive && p.type !== "number")) ?
             ((p.primitive && p.type === "number") ? "f64" :
-                p.type == "boolean" ? "bool" : p.type == "logical" ? "Logical" : p.type == "string" ? "String" : `&'a ${p.type}<'a>`) : `&'a ${p.type}<'a>`;
+                p.type == "boolean" ? "bool" : p.type == "logical" ? "IfcEnum" : p.type == "string" ? "String" : `&'a ${p.type}<'a>`) : `&'a ${p.type}<'a>`;
         let type = isVec && isMultiDimensions && isOptional ?
             `Option<Vec<Vec<${typeName}>>>` : isVec && isMultiDimensions && !isOptional ?
                 `Vec<Vec<${typeName}>>` : (isVec || isMultiDimensions) && isOptional ?
