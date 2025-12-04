@@ -172,7 +172,11 @@ namespace webifc::geometry
 
             if (localPlacement != 0 && _loader.IsValidExpressID(localPlacement))
             {
-                mesh.transformation = _geometryLoader.GetLocalPlacement(localPlacement);
+                if (_useRelativePlacement) {
+                    mesh.transformation = _geometryLoader.GetRelativePlacement(localPlacement);
+                } else {
+                    mesh.transformation = _geometryLoader.GetLocalPlacement(localPlacement);
+                }
             }
 
             if (ifcPresentation != 0 && _loader.IsValidExpressID(ifcPresentation))

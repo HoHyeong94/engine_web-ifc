@@ -60,6 +60,9 @@ namespace webifc::geometry
     glm::dmat4 GetCoordinationMatrix() const;
     void Clear();
     IfcGeometryProcessor *Clone(const webifc::parsing::IfcLoader &loader) const;
+    void SetRelativePlacement(bool active) {
+      _useRelativePlacement = active;
+    }
 
   protected:
     IfcGeometryProcessor(const IfcGeometrySettings &settings, std::unordered_map<uint32_t, IfcGeometry> expressIDToGeometry, const IfcGeometryLoader &geometryLoader, glm::dmat4 transformation, const parsing::IfcLoader &loader, booleanManager boolEngine, const schema::IfcSchemaManager &schemaManager, bool isCoordinated, uint32_t expressIdCyl, uint32_t expressIdRect, glm::dmat4 coordinationMatrix, IfcGeometry predefinedCylinder, IfcGeometry predefinedCube);
@@ -84,5 +87,6 @@ namespace webifc::geometry
     void ReadIndexedPolygonalFace(uint32_t expressID, std::vector<IfcBound3D> &bounds, const std::vector<glm::dvec3> &points);
     IfcGeometry _predefinedCylinder;
     IfcGeometry _predefinedCube;
+    bool _useRelativePlacement = false;
   };
 }

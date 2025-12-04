@@ -4149,6 +4149,30 @@ namespace webifc::geometry
       return glm::dmat4(1);
     }
   }
+  
+  glm::dmat4 IfcGeometryLoader::GetRelativePlacement(uint32_t placementID) const
+  {
+    if (placementID == 0 || !_loader.IsValidExpressID(placementID))
+    {
+      return glm::dmat4(1.0);
+    }
+
+    auto lineType = _loader.GetLineType(placementID);
+
+    if (lineType == schema::IFCLOCALPLACEMENT)
+    {
+      _loader.MoveToArgumentOffset(placementID, 1);
+
+      uint32_t relativePlacementID = _loader.GetRefArgument();
+
+      return GetLocalPlacement(relativePlacementID);
+    }
+    else if (lineType == schema::IFCGRIDPLACEMENT)
+    {
+      return GetLocalPlacement(placementID);
+    }
+    return GetLocalPlacement(placementID);
+  }
 
   std::array<glm::dvec3, 2> IfcGeometryLoader::GetAxis1Placement(const uint32_t expressID) const
   {
