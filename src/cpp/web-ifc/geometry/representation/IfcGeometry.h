@@ -64,6 +64,10 @@ namespace webifc::geometry {
 		uint32_t GetVertexDataSize();
 		uint32_t GetIndexData();
 		uint32_t GetIndexDataSize();
+		const float *GetVertexDataRust();
+		size_t GetVertexDataSizeRust();
+		const uint32_t *GetIndexDataRust();
+		size_t GetIndexDataSizeRust();
 		SweptDiskSolid GetSweptDiskSolid();
 		glm::dmat4 Normalize();
 		SweptDiskSolid sweptDiskSolid;

@@ -231,6 +231,29 @@ namespace webifc::geometry {
 		return (uint32_t)(size_t)&fvertexData[0];
 	}
 
+	const float *IfcGeometry::GetVertexDataRust()
+	{
+		// unfortunately webgl can't do doubles
+		if (fvertexData.size() != vertexData.size())
+		{
+			fvertexData.resize(vertexData.size());
+			for (size_t i = 0; i < vertexData.size(); i++)
+			{
+				// The vector was previously copied in batches of 6, but
+				// copying single entry at a time is more resilient if the
+				// underlying geometry lib changes the treatment of normals
+				fvertexData[i] = vertexData[i];
+			}
+		}
+		if (fvertexData.empty())
+		{
+			return 0;
+		}
+		// spdlog::info("vertexDataFirstElement {}", fvertexData[0]);
+		// spdlog::info("vertexDataAddress {}", fvertexData.data());
+		return fvertexData.data();
+	}
+
     uint32_t IfcGeometry::GetVertexDataSize()
 	{
 		return (uint32_t)fvertexData.size();
@@ -241,9 +264,19 @@ namespace webifc::geometry {
 		return (uint32_t)(size_t)&indexData[0];
 	}
 
+	const uint32_t *IfcGeometry::GetIndexDataRust()
+	{
+		return indexData.data();
+	}
+
 	uint32_t IfcGeometry::GetIndexDataSize()
 	{
 		return (uint32_t)indexData.size();
+	}
+
+	size_t IfcGeometry::GetIndexDataSizeRust()
+	{
+		return indexData.size();
 	}
 
 	SweptDiskSolid IfcGeometry::GetSweptDiskSolid()
