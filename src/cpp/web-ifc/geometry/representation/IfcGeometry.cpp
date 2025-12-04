@@ -259,6 +259,11 @@ namespace webifc::geometry {
 		return (uint32_t)fvertexData.size();
 	}
 
+	size_t IfcGeometry::GetVertexDataSizeRust()
+	{
+		return fvertexData.size();
+	}
+
 	uint32_t IfcGeometry::GetIndexData()
 	{
 		return (uint32_t)(size_t)&indexData[0];
