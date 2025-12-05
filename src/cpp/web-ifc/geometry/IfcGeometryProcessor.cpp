@@ -1650,6 +1650,9 @@ namespace webifc::geometry
 
         IfcComposedMesh composedMesh = GetMesh(expressID);
 
+        flatMesh.transformation = composedMesh.transformation;
+        flatMesh.SetFlatTransformation();
+
         glm::dmat4 mat = glm::dmat4(1);
         if (applyLinearScalingFactor)
         {

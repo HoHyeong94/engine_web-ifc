@@ -234,6 +234,28 @@ namespace webifc::geometry {
 		{
 			std::vector<IfcPlacedGeometry> geometries;
 			uint32_t expressID;
+			glm::dmat4 transformation;
+			std::array<double, 16> flatTransformation;
+
+			void SetFlatTransformation()
+			{
+				flatTransformation = FlattenTransformation(transformation);
+			}
+
+			std::array<double, 16> FlattenTransformation(const glm::dmat4 &transformation)
+			{
+				std::array<double, 16> flatTransformation;
+
+				for (int i = 0; i < 4; i++)
+				{
+					for (int j = 0; j < 4; j++)
+					{
+						flatTransformation[i * 4 + j] = transformation[i][j];
+					}
+				}
+
+				return flatTransformation;
+			}
 		};
 
 		struct IfcComposedMesh
