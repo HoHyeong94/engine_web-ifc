@@ -62,7 +62,8 @@ namespace webifc::geometry
     IfcGeometryProcessor *Clone(const webifc::parsing::IfcLoader &loader) const;
     void SetRelativePlacement(bool active) {
       _useRelativePlacement = active;
-    }
+    };
+    std::array<double, 16> GetFlatSpatialNodeMatrix(uint32_t expressID);
 
   protected:
     IfcGeometryProcessor(const IfcGeometrySettings &settings, std::unordered_map<uint32_t, IfcGeometry> expressIDToGeometry, const IfcGeometryLoader &geometryLoader, glm::dmat4 transformation, const parsing::IfcLoader &loader, booleanManager boolEngine, const schema::IfcSchemaManager &schemaManager, bool isCoordinated, uint32_t expressIdCyl, uint32_t expressIdRect, glm::dmat4 coordinationMatrix, IfcGeometry predefinedCylinder, IfcGeometry predefinedCube);

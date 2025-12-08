@@ -63,6 +63,38 @@ namespace webifc::geometry
         std::unordered_map<uint32_t, IfcGeometry>().swap(_expressIDToGeometry);
         _geometryLoader.Clear();
     }
+    std::array<double, 16> IfcGeometryProcessor::GetFlatSpatialNodeMatrix(uint32_t expressID)
+    {
+        std::array<double, 16> flatTransformation;
+        glm::dmat4 transformation(1);
+        auto lineType = _loader.GetLineType(expressID);
+
+        if (_schemaManager.IsIfcElement(lineType))
+        {
+            _loader.MoveToArgumentOffset(expressID, 5);
+            uint32_t localPlacement = 0;
+            if (_loader.GetTokenType() == parsing::IfcTokenType::REF)
+            {
+                _loader.StepBack();
+                localPlacement = _loader.GetRefArgument();
+            }
+
+            if (localPlacement != 0 && _loader.IsValidExpressID(localPlacement))
+            {
+                transformation = _geometryLoader.GetRelativePlacement(localPlacement);
+            }
+        }
+
+        for (int i = 0; i < 4; i++)
+        {
+            for (int j = 0; j < 4; j++)
+            {
+                flatTransformation[i * 4 + j] = transformation[i][j];
+            }
+        }
+
+        return flatTransformation;
+    }
 
     std::array<double, 16> IfcGeometryProcessor::GetFlatCoordinationMatrix() const
     {
