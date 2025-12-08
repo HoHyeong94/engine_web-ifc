@@ -1682,9 +1682,6 @@ namespace webifc::geometry
 
         IfcComposedMesh composedMesh = GetMesh(expressID);
 
-        flatMesh.transformation = composedMesh.transformation;
-        flatMesh.SetFlatTransformation();
-
         glm::dmat4 mat = glm::dmat4(1);
         if (applyLinearScalingFactor)
         {
@@ -1694,7 +1691,14 @@ namespace webifc::geometry
 
         glm::dvec4 color = glm::dvec4(1, 1, 1, 1);
         bool hasColor = false;
-        AddComposedMeshToFlatMesh(flatMesh, composedMesh, _transformation * NormalizeIFC * mat, color, hasColor);
+        if (_useRelativePlacement) {
+            flatMesh.transformation = composedMesh.transformation;
+            flatMesh.SetFlatTransformation();
+            composedMesh.transformation = glm::dmat4(1);
+            AddComposedMeshToFlatMesh(flatMesh, composedMesh, _transformation * mat, color, hasColor);
+        } else {
+            AddComposedMeshToFlatMesh(flatMesh, composedMesh, _transformation * NormalizeIFC * mat, color, hasColor);
+        }
 
         return flatMesh;
     }
