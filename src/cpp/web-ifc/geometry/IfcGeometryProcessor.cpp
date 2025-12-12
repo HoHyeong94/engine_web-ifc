@@ -63,7 +63,7 @@ namespace webifc::geometry
         std::unordered_map<uint32_t, IfcGeometry>().swap(_expressIDToGeometry);
         _geometryLoader.Clear();
     }
-    std::array<double, 16> IfcGeometryProcessor::GetFlatSpatialNodeMatrix(uint32_t expressID)
+    std::array<double, 16> IfcGeometryProcessor::GetFlatSpatialNodeMatrix(uint32_t expressID, bool isRelative)
     {
         std::array<double, 16> flatTransformation;
         glm::dmat4 transformation(1);
@@ -81,7 +81,11 @@ namespace webifc::geometry
 
             if (localPlacement != 0 && _loader.IsValidExpressID(localPlacement))
             {
-                transformation = _geometryLoader.GetRelativePlacement(localPlacement);
+                if (isRelative) {
+                    transformation = _geometryLoader.GetRelativePlacement(localPlacement);
+                } else {
+                    transformation = _geometryLoader.GetLocalPlacement(localPlacement);
+                }
             }
         }
 
@@ -1695,7 +1699,7 @@ namespace webifc::geometry
             flatMesh.transformation = composedMesh.transformation;
             flatMesh.SetFlatTransformation();
             composedMesh.transformation = glm::dmat4(1);
-            AddComposedMeshToFlatMesh(flatMesh, composedMesh, _transformation * mat, color, hasColor);
+            AddComposedMeshToFlatMesh(flatMesh, composedMesh, _transformation, color, hasColor);
         } else {
             AddComposedMeshToFlatMesh(flatMesh, composedMesh, _transformation * NormalizeIFC * mat, color, hasColor);
         }

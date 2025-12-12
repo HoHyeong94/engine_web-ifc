@@ -4167,10 +4167,6 @@ namespace webifc::geometry
 
       return GetLocalPlacement(relativePlacementID);
     }
-    else if (lineType == schema::IFCGRIDPLACEMENT)
-    {
-      return GetLocalPlacement(placementID);
-    }
     return GetLocalPlacement(placementID);
   }
 
