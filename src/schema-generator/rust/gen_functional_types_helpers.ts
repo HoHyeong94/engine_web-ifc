@@ -1,3 +1,4 @@
+import { ifcRootList } from "./gen_functional_types";
 import { Entity, Type, Prop } from "./gen_functional_types_interfaces";
 
 export function generateInitialiser(type: Type, initialisersDone: Set<string>, buffer: Array<string>, crcTable: any, types: Type[], schemaName: string, schemaNo: number) {
@@ -346,6 +347,7 @@ export function generateStructByMacro(entity: Entity, classBuffer: Array<string>
     //isifcRoot
     if (ifcRootProps === 4) {
         isifcroot = true;
+        ifcRootList.add(entity.name);
     } else {
         isifcroot = false;
     }

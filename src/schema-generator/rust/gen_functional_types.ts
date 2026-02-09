@@ -20,6 +20,8 @@ completeEntityList.add("FILE_DESCRIPTION");
 
 let typeList = new Set<string>();
 
+export let ifcRootList = new Set<string>();
+
 rsSchema.push(`use once_cell::sync::Lazy;`);
 rsSchema.push(`use std::convert::Into;`);
 rsSchema.push(`use std::collections::HashMap;`);
@@ -655,6 +657,25 @@ for (var i = 0; i < files.length; i++) {
 
     rsSchema.push("}");
 }
+
+let ifcRootTypeCodeList: Array<number> = [];
+
+ifcRootList.forEach(entity => {
+    let name = entity.toUpperCase();
+    let code = crc32(name, crcTable);
+
+    ifcRootTypeCodeList.push(code);
+});
+
+rsSchema.push(`pub const IFCROOT_TYPECODELIST: [u32; ${ifcRootTypeCodeList.length}] = [`);
+
+ifcRootTypeCodeList.forEach(code => {
+    rsSchema.push(`${code}, `);
+})
+
+rsSchema.slice(0, -2);
+
+rsSchema.push("];");
 
 new Set([...completeEntityList, ...typeList]).forEach(entity => {
     let name = entity.toUpperCase();
