@@ -7,6 +7,7 @@
 #include <vector>
 #include <unordered_map>
 #include <istream>
+#include <sstream>
 #include <set>
 #include <cstdint>
 #include <string_view>
@@ -28,6 +29,10 @@ namespace webifc::parsing
       void LoadFile(std::istream &requestData);
       void SaveFile(const std::function<void(char *, size_t)> &outputData, bool orderLinesByExpressID) const;
       void SaveFile(std::ostream &outputData, bool orderLinesByExpressID) const;
+      // Serialize one data line to STEP text ("#<id>=TYPE(args...);", no trailing
+      // newline) straight off the tape, using the SAME per-line serializer as
+      // SaveFile. No-op for an invalid/absent express id. (gvcs-ifc P2.3.)
+      void SerializeLine(uint32_t expressID, std::ostringstream &output) const;
       const std::vector<uint32_t> GetExpressIDsWithType(const uint32_t type) const;
       uint32_t GetMaxExpressId() const;
       bool IsValidExpressID(const uint32_t expressID) const;
@@ -87,7 +92,11 @@ namespace webifc::parsing
       std::vector<IfcLine> _headerLines;
       std::unordered_map<uint32_t, std::vector<uint32_t>> _ifcTypeToExpressID;
       void ParseLines();
-      void ArgumentOffset(const uint32_t argumentIndex) const;      
+      void ArgumentOffset(const uint32_t argumentIndex) const;
+      // Walk one line's tokens from `tapeOffset`, emitting its STEP text up to and
+      // including the terminating ';' (no newline). Shared by SaveFile and
+      // SerializeLine so there is one serializer, not two. (gvcs-ifc P2.3.)
+      void SerializeLineFromTape(uint32_t tapeOffset, std::ostringstream &output) const;
       
 	};
 }

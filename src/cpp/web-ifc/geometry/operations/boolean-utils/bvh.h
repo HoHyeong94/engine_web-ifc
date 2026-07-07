@@ -91,7 +91,12 @@ namespace fuzzybools
         template <typename T>
         bool IntersectRay(const glm::dvec3& origin, const glm::dvec3& dir, T callback)
         {
-            static std::vector<uint32_t> stack;
+            // thread_local: gvcs-ifc drives multi-file ingest from a K-thread
+            // pool (one engine per thread, see web_ifc_wrapper.cpp). A single
+            // process-wide scratch buffer would be corrupted by concurrent
+            // boolean/ray tests on different models. Per-thread keeps the
+            // reuse optimization (cleared each call) while making it race-free.
+            static thread_local std::vector<uint32_t> stack;
             stack.clear();
 
             if (nodes.empty())

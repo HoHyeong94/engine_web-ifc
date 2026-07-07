@@ -108,96 +108,17 @@ namespace webifc::parsing {
 		}
         for(uint32_t i=0; i < currentLines->size();i++)
         {
-       
+
           IfcLine * line = &(*currentLines)[i];
 
           if (line->ifcType == 0) continue;
-          _tokenStream->MoveTo(line->tapeOffset);
-          bool newLine = true;
-          bool insideSet = false;
-          IfcTokenType prev = IfcTokenType::EMPTY;
-          while (!_tokenStream->IsAtEnd())
-          {
-            IfcTokenType t = static_cast<IfcTokenType>(_tokenStream->Read<char>());
+          // Per-line serialization is shared with SerializeLine (gvcs-ifc P2.3):
+          // it emits the line body up to the terminating ';' (no newline); the
+          // newline that SaveFile used to write as part of ";" << std::endl is
+          // appended here, so this remains byte-identical to the old writer.
+          SerializeLineFromTape(line->tapeOffset, output);
+          output << std::endl;
 
-            if (t != IfcTokenType::SET_END && t != IfcTokenType::LINE_END)
-            {
-              if (insideSet && prev != IfcTokenType::SET_BEGIN && prev != IfcTokenType::LABEL && prev != IfcTokenType::LINE_END)
-              {
-                output << ",";
-              }
-            }
-
-            if (t == IfcTokenType::LINE_END)
-            {
-              output << ";" << std::endl;
-              break;
-            }
-
-            switch (t)
-            {
-              case IfcTokenType::UNKNOWN:
-              {
-                output << "*";
-                break;
-              }
-              case IfcTokenType::EMPTY:
-              {
-                output << "$";
-                break;
-              }
-              case IfcTokenType::SET_BEGIN:
-              {
-                output << "(";
-                insideSet = true;
-                break;
-              }
-              case IfcTokenType::SET_END:
-              {
-                output << ")";
-                break;
-              }
-              case IfcTokenType::STRING:
-              {
-                output << "'";
-                p21encode(_tokenStream->ReadString(),output);
-                output << "'";
-                break;
-              }
-              case IfcTokenType::ENUM:
-              {
-                output << "." << _tokenStream->ReadString() << ".";
-                break;
-              }
-              case IfcTokenType::REF:
-              {
-                output << "#" << _tokenStream->Read<uint32_t>();
-                if (newLine) output << "=";
-                break;
-              }
-              case IfcTokenType::LABEL:
-              case IfcTokenType::REAL:
-              case IfcTokenType::INTEGER:
-              { 
-                output << _tokenStream->ReadString();
-                break;
-              }
-              default:
-                break;
-            }
-
-            if (t == IfcTokenType::LINE_END)
-            {
-              newLine = true;
-              insideSet = false;
-            }
-            else
-            {
-              newLine = false;
-            }
-            prev = t;
-          }
-        
           linesWritten++;
           if (linesWritten > _lineWriterBuffer ) 
           {
@@ -216,12 +137,112 @@ namespace webifc::parsing {
    }
    
    void IfcLoader::SaveFile(std::ostream &outputData, bool orderLinesByExpressID) const
-   { 
+   {
      SaveFile([&](char* src, size_t srcSize) {
           outputData.write(src,srcSize);
 		 },orderLinesByExpressID);
    }
-      
+
+   void IfcLoader::SerializeLineFromTape(uint32_t tapeOffset, std::ostringstream &output) const
+   {
+      _tokenStream->MoveTo(tapeOffset);
+      bool newLine = true;
+      bool insideSet = false;
+      IfcTokenType prev = IfcTokenType::EMPTY;
+      while (!_tokenStream->IsAtEnd())
+      {
+        IfcTokenType t = static_cast<IfcTokenType>(_tokenStream->Read<char>());
+
+        if (t != IfcTokenType::SET_END && t != IfcTokenType::LINE_END)
+        {
+          if (insideSet && prev != IfcTokenType::SET_BEGIN && prev != IfcTokenType::LABEL && prev != IfcTokenType::LINE_END)
+          {
+            output << ",";
+          }
+        }
+
+        if (t == IfcTokenType::LINE_END)
+        {
+          // Terminating ';' only — the caller appends the newline (SaveFile) or
+          // the batch separator (SerializeLine callers).
+          output << ";";
+          break;
+        }
+
+        switch (t)
+        {
+          case IfcTokenType::UNKNOWN:
+          {
+            output << "*";
+            break;
+          }
+          case IfcTokenType::EMPTY:
+          {
+            output << "$";
+            break;
+          }
+          case IfcTokenType::SET_BEGIN:
+          {
+            output << "(";
+            insideSet = true;
+            break;
+          }
+          case IfcTokenType::SET_END:
+          {
+            output << ")";
+            break;
+          }
+          case IfcTokenType::STRING:
+          {
+            output << "'";
+            p21encode(_tokenStream->ReadString(),output);
+            output << "'";
+            break;
+          }
+          case IfcTokenType::ENUM:
+          {
+            output << "." << _tokenStream->ReadString() << ".";
+            break;
+          }
+          case IfcTokenType::REF:
+          {
+            output << "#" << _tokenStream->Read<uint32_t>();
+            if (newLine) output << "=";
+            break;
+          }
+          case IfcTokenType::LABEL:
+          case IfcTokenType::REAL:
+          case IfcTokenType::INTEGER:
+          {
+            output << _tokenStream->ReadString();
+            break;
+          }
+          default:
+            break;
+        }
+
+        if (t == IfcTokenType::LINE_END)
+        {
+          newLine = true;
+          insideSet = false;
+        }
+        else
+        {
+          newLine = false;
+        }
+        prev = t;
+      }
+   }
+
+   void IfcLoader::SerializeLine(uint32_t expressID, std::ostringstream &output) const
+   {
+      const auto lineIt = _lines.find(expressID);
+      if (lineIt == _lines.end()) return;
+      if (lineIt->second.ifcType == 0) return;
+      SerializeLineFromTape(lineIt->second.tapeOffset, output);
+   }
+
+
    bool IfcLoader::IsAtEnd() const
    {
      return _tokenStream->IsAtEnd();

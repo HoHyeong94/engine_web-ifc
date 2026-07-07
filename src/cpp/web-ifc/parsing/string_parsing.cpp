@@ -58,12 +58,12 @@ namespace webifc::parsing {
     }
 
     void p21encode(std::string_view input, std::ostringstream &output)
-    {   
+    {
         std::string tmp;
         bool inEncode=false;
         for (char c : input) {
-          if (c > 126 || c < 32) { 
-            if (!inEncode) 
+          if (c > 126 || c < 32) {
+            if (!inEncode)
             {
               inEncode = true;
               tmp=c;
@@ -78,6 +78,18 @@ namespace webifc::parsing {
                 inEncode=false;
                 tmp.clear();
             } else if (c==39) {
+                output << c << c;
+                continue;
+            }
+            // ISO 10303-21 (STEP physical file, clause 6.3.3.2 / p21e3 §11)
+            // reserves '\' (0x5C) as the escape introducer, so a *literal*
+            // backslash MUST be written doubled ('\\'); a bare '\' is a decode
+            // error — this engine's own P21Decoder ('\\' case in string_parsing)
+            // rejects it. Applied after any encode-run flush so a backslash next
+            // to non-ASCII text is escaped too. Byte-identical to the previous
+            // writer for all callers except that literal backslashes now
+            // round-trip (Windows FILE_NAME / IfcLabel paths in AVEVA exports).
+            if (c==92) {
                 output << c << c;
                 continue;
             }

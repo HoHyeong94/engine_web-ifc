@@ -111,7 +111,11 @@ namespace fuzzybools
 
         Line()
         {
-            static size_t idcounter = 0;
+            // thread_local: globalID is write-only (never read anywhere in the
+            // engine), so per-thread numbering changes no geometry output; the
+            // qualifier only removes the data race when several ingest threads
+            // build boolean geometry at once (see bvh.h / web_ifc_wrapper.cpp).
+            static thread_local size_t idcounter = 0;
             idcounter++;
             globalID = idcounter;
         }
@@ -250,7 +254,9 @@ namespace fuzzybools
 
         Point()
         {
-            static size_t idcounter = 0;
+            // thread_local: write-only globalID (see Line()); per-thread makes
+            // concurrent construction race-free without changing output.
+            static thread_local size_t idcounter = 0;
             idcounter++;
             globalID = idcounter;
         }
@@ -291,7 +297,9 @@ namespace fuzzybools
 
         Plane()
         {
-            static size_t idcounter = 0;
+            // thread_local: write-only globalID (see Line()); per-thread makes
+            // concurrent construction race-free without changing output.
+            static thread_local size_t idcounter = 0;
             idcounter++;
             globalID = idcounter;
         }
@@ -1305,7 +1313,9 @@ namespace fuzzybools
 
             std::set<std::pair<size_t, size_t>> edges;
             std::set<std::pair<size_t, size_t>> defaultEdges;
-            static int i = 0;
+            // thread_local: leftover debug counter, result unused; per-thread
+            // only to keep concurrent triangulation race-free.
+            static thread_local int i = 0;
             i++;
 
             for (auto &line : p.lines)
