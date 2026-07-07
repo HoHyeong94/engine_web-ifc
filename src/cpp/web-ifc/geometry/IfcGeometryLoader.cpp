@@ -4329,4 +4329,12 @@ namespace webifc::geometry
     return result;
   }
 
+  // The scaling accessors migrated into IfcCache during the fork's cache
+  // refactor, leaving this declaration dangling in IfcGeometryLoader.h.
+  // Forward to the cache so external consumers (the gvcs-ifc wrapper) link.
+  double IfcGeometryLoader::GetLinearScalingFactor() const
+  {
+    return _cache.GetLinearScalingFactor();
+  }
+
 }

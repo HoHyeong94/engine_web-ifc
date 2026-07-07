@@ -295,6 +295,11 @@ namespace webifc::geometry
 		return sweptDiskSolid;
 	}
 
+	Extrusion IfcGeometry::GetExtrusion()
+	{
+		return extrusion;
+	}
+
 	void IfcGeometry::AddPart(IfcGeometry geom)
 	{
 		part.push_back(geom);

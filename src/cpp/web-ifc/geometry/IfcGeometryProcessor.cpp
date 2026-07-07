@@ -1043,6 +1043,19 @@ namespace webifc::geometry
                             geom.indexData[i * 3 + 1] = temp;
                         }
                     }
+                    // gvcs-ifc: retain the parametric source (mirrors the
+                    // sweptDiskSolid precedent). Tapered solids run this same
+                    // case but are NOT pure prism extrusions, so only plain
+                    // IFCEXTRUDEDAREASOLID qualifies. Boolean results build
+                    // fresh IfcGeometry objects, so the flag survives only on
+                    // boolean-free geometry.
+                    if (lineType == schema::IFCEXTRUDEDAREASOLID)
+                    {
+                        geom.extrusion.Active = true;
+                        geom.extrusion.Direction = dir;
+                        geom.extrusion.Profile = profile;
+                        geom.extrusion.Length = depth;
+                    }
                 }
                 else
                 {

@@ -69,8 +69,14 @@ namespace webifc::geometry {
 		const uint32_t *GetIndexDataRust();
 		size_t GetIndexDataSizeRust();
 		SweptDiskSolid GetSweptDiskSolid();
+		Extrusion GetExtrusion();
 		glm::dmat4 Normalize();
 		SweptDiskSolid sweptDiskSolid;
+		// Parametric source retained when this geometry is a pure,
+		// boolean-free IFCEXTRUDEDAREASOLID (gvcs-ifc addition, mirrors
+		// the sweptDiskSolid precedent). Boolean/CSG results never carry
+		// it, so extrusion.Active doubles as the "boolean-free" flag.
+		Extrusion extrusion;
 		private:
 			void ReverseFace(uint32_t index);
 			bool normalized = false;
