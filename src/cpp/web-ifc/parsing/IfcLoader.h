@@ -13,6 +13,7 @@
 
 #include "IfcTokenStream.h"
 #include "../schema/IfcSchemaManager.h"
+#include <ankerl/unordered_dense.h>
 
 namespace webifc::parsing
 {
@@ -65,7 +66,6 @@ namespace webifc::parsing
       void PushInt(int input);
       std::string GenerateUUID() const;
       IfcLoader* Clone();
-
       uint32_t GetNextExpressID(uint32_t expressId) const;
       template <typename T> void Push(T input)
       {
@@ -78,13 +78,13 @@ namespace webifc::parsing
         uint32_t ifcType;
         uint32_t tapeOffset;
       };
-      IfcLoader(uint32_t maxExpressId, uint32_t lineWriterBuffer, const schema::IfcSchemaManager &schemaManager, IfcTokenStream * tokenStream, std::unordered_map<uint32_t,IfcLine*> &lines, std::vector<IfcLine*> &headerLines,std::unordered_map<uint32_t, std::vector<uint32_t>> &ifcTypeToExpressID);
+      IfcLoader(uint32_t maxExpressId, uint32_t lineWriterBuffer, const schema::IfcSchemaManager &schemaManager, IfcTokenStream * tokenStream, ankerl::unordered_dense::map<uint32_t, IfcLine> &lines, std::vector<IfcLine> &headerLines,std::unordered_map<uint32_t, std::vector<uint32_t>> &ifcTypeToExpressID);
       uint32_t _maxExpressId;
       const uint32_t _lineWriterBuffer;
       const schema::IfcSchemaManager &_schemaManager;
       IfcTokenStream * _tokenStream;
-      std::unordered_map<uint32_t,IfcLine*> _lines;
-      std::vector<IfcLine*> _headerLines;
+      ankerl::unordered_dense::map<uint32_t, IfcLine> _lines;
+      std::vector<IfcLine> _headerLines;
       std::unordered_map<uint32_t, std::vector<uint32_t>> _ifcTypeToExpressID;
       void ParseLines();
       void ArgumentOffset(const uint32_t argumentIndex) const;      

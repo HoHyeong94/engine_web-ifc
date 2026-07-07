@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.18)
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 	message("Building In Debug Mode")
 	set(RELEASE false)
-	set(DEBUG_FLAG "-g")
+	set(DEBUG_FLAG "-g -O3")
 else()
 	set(DEBUG_FLAG "-O3")
 	set(RELEASE true)
@@ -26,7 +26,7 @@ file(GLOB_RECURSE web-ifc-wasm wasm/*.cpp)
 
 # download the external projects and save their paths
 Message("Downloading FastFloat")
-FetchContent_Declare(fastfloat GIT_REPOSITORY "https://github.com/fastfloat/fast_float" GIT_TAG "2b2395f9ac836ffca6404424bcc252bff7aa80e4" SOURCE_SUBDIR "../")
+FetchContent_Declare(fastfloat GIT_REPOSITORY "https://github.com/fastfloat/fast_float" GIT_TAG "05087a303dad9c98768b33c829d398223a649bc6" SOURCE_SUBDIR "../")
 FetchContent_MakeAvailable(fastfloat)
 FetchContent_GetProperties(fastfloat)
 
@@ -41,7 +41,7 @@ FetchContent_MakeAvailable(tinycpptest)
 FetchContent_GetProperties(tinycpptest)
 
 Message("Downloading GLM")
-FetchContent_Declare(glm GIT_REPOSITORY "https://github.com/g-truc/glm" GIT_TAG "0af55ccecd98d4e5a8d1fad7de25ba429d60e863" SOURCE_SUBDIR "../")
+FetchContent_Declare(glm GIT_REPOSITORY "https://github.com/g-truc/glm" GIT_TAG "8d1fd52e5ab5590e2c81768ace50c72bae28f2ed" SOURCE_SUBDIR "../")
 FetchContent_MakeAvailable(glm)
 FetchContent_GetProperties(glm)
 
@@ -51,12 +51,12 @@ FetchContent_MakeAvailable(earcut)
 FetchContent_GetProperties(earcut)
 
 Message("Downloading CDT")
-FetchContent_Declare(cdt GIT_REPOSITORY "https://github.com/artem-ogre/CDT" GIT_TAG "4d0c9026b8ec846fe544897e7111f8f9080d5f8a" SOURCE_SUBDIR "../")
+FetchContent_Declare(cdt GIT_REPOSITORY "https://github.com/artem-ogre/CDT" GIT_TAG "5a1d702a01b24b33555913b90934fe673d51fc0f" SOURCE_SUBDIR "../")
 FetchContent_MakeAvailable(cdt)
 FetchContent_GetProperties(cdt)
 
 Message("Downloading spdlog")
-FetchContent_Declare(spdlog GIT_REPOSITORY "https://github.com/gabime/spdlog" GIT_TAG "f355b3d58f7067eee1706ff3c801c2361011f3d5" SOURCE_SUBDIR "../")
+FetchContent_Declare(spdlog GIT_REPOSITORY "https://github.com/gabime/spdlog" GIT_TAG "79524ddd08a4ec981b7fea76afd08ee05f83755d" SOURCE_SUBDIR "../")
 FetchContent_MakeAvailable(spdlog)
 FetchContent_GetProperties(spdlog)
 
@@ -65,18 +65,23 @@ FetchContent_Declare(stduuid GIT_REPOSITORY "https://github.com/mariusbancila/st
 FetchContent_MakeAvailable(stduuid)
 FetchContent_GetProperties(stduuid)
 
+Message("Downloading unordered_dense")
+FetchContent_Declare(unordered_dense GIT_REPOSITORY "https://github.com/martinus/unordered_dense" GIT_TAG "3234af2c03549bc85656bfd3a86993bf1cd8aef1" SOURCE_SUBDIR "../")
+FetchContent_MakeAvailable(unordered_dense)
+FetchContent_GetProperties(unordered_dense)
 
 Message("Downloads Finished")
 
 function(PARAM_SETTER THE_EXECUTABLE)
-	target_include_directories(${THE_EXECUTABLE} PUBLIC ${tinynurbs_SOURCE_DIR}/include)
-	target_include_directories(${THE_EXECUTABLE} PUBLIC ${fastfloat_SOURCE_DIR}/include)
-	target_include_directories(${THE_EXECUTABLE} PUBLIC ${cdt_SOURCE_DIR}/CDT/include)
-	target_include_directories(${THE_EXECUTABLE} PUBLIC ${glm_SOURCE_DIR}/)
-	target_include_directories(${THE_EXECUTABLE} PUBLIC ${glm_SOURCE_DIR}/glm)
-	target_include_directories(${THE_EXECUTABLE} PUBLIC ${earcut_SOURCE_DIR}/include)
-	target_include_directories(${THE_EXECUTABLE} PUBLIC ${spdlog_SOURCE_DIR}/include)
-	target_include_directories(${THE_EXECUTABLE} PUBLIC ${stduuid_SOURCE_DIR}/include)
+	target_include_directories(${THE_EXECUTABLE} PUBLIC $<BUILD_INTERFACE:${tinynurbs_SOURCE_DIR}/include>)
+	target_include_directories(${THE_EXECUTABLE} PUBLIC $<BUILD_INTERFACE:${fastfloat_SOURCE_DIR}/include>)
+	target_include_directories(${THE_EXECUTABLE} PUBLIC $<BUILD_INTERFACE:${cdt_SOURCE_DIR}/CDT/include>)
+	target_include_directories(${THE_EXECUTABLE} PUBLIC $<BUILD_INTERFACE:${glm_SOURCE_DIR}/>)
+	target_include_directories(${THE_EXECUTABLE} PUBLIC $<BUILD_INTERFACE:${glm_SOURCE_DIR}/glm>)
+	target_include_directories(${THE_EXECUTABLE} PUBLIC $<BUILD_INTERFACE:${earcut_SOURCE_DIR}/include>)
+	target_include_directories(${THE_EXECUTABLE} PUBLIC $<BUILD_INTERFACE:${spdlog_SOURCE_DIR}/include>)
+	target_include_directories(${THE_EXECUTABLE} PUBLIC $<BUILD_INTERFACE:${stduuid_SOURCE_DIR}/include>)
+	target_include_directories(${THE_EXECUTABLE} PUBLIC $<BUILD_INTERFACE:${unordered_dense_SOURCE_DIR}/include>)
 
 	if(NOT MSVC)
 		target_compile_options(${THE_EXECUTABLE} PUBLIC "-Wall")
@@ -103,23 +108,34 @@ if(EMSCRIPTEN)
 	# build parameters for web-ifc
 	add_executable(web-ifc ${web-ifc-source} ${web-ifc-wasm})
 	param_setter(web-ifc)
-	set_target_properties(web-ifc PROPERTIES LINK_FLAGS "${DEBUG_FLAG} --bind -flto --define-macro=REAL_T_IS_DOUBLE -s ALLOW_MEMORY_GROWTH=1 -s MAXIMUM_MEMORY=4GB -sSTACK_SIZE=5MB -s EXPORT_NAME=WebIFCWasm -s MODULARIZE=1 -s ENVIRONMENT=web")
+	set_target_properties(web-ifc PROPERTIES LINK_FLAGS "${DEBUG_FLAG} --bind -msimd128 -flto --define-macro=REAL_T_IS_DOUBLE -s ALLOW_MEMORY_GROWTH=1 -s DYNAMIC_EXECUTION=0 -s MAXIMUM_MEMORY=4GB -sSTACK_SIZE=5MB -s EXPORT_NAME=WebIFCWasm -s MODULARIZE=1 -s ENVIRONMENT=web  -sASSERTIONS=1 -s EXPORTED_RUNTIME_METHODS=\"['HEAPU8','HEAPU32','HEAPF32']\"")
 
 	add_executable(web-ifc-node ${web-ifc-source} ${web-ifc-wasm})
 	param_setter(web-ifc-node)
-	set_target_properties(web-ifc-node PROPERTIES LINK_FLAGS "${DEBUG_FLAG} --bind -flto --define-macro=REAL_T_IS_DOUBLE -s ALLOW_MEMORY_GROWTH=1 -s MAXIMUM_MEMORY=4GB -sSTACK_SIZE=5MB -s EXPORT_NAME=WebIFCWasm -s MODULARIZE=1 -s EXPORTED_RUNTIME_METHODS=\"['HEAPU8','HEAPU32','HEAPF32']\"")
+	set_target_properties(web-ifc-node PROPERTIES LINK_FLAGS "${DEBUG_FLAG} --bind -msimd128 -flto --define-macro=REAL_T_IS_DOUBLE -s ALLOW_MEMORY_GROWTH=1 -s DYNAMIC_EXECUTION=0 -s MAXIMUM_MEMORY=4GB -sSTACK_SIZE=5MB -s EXPORT_NAME=WebIFCWasm -s MODULARIZE=1 -s EXPORTED_RUNTIME_METHODS=\"['HEAPU8','HEAPU32','HEAPF32']\"")
 
 	# multi-treaded versions
 	add_executable(web-ifc-mt ${web-ifc-source} ${web-ifc-wasm})
 	param_setter(web-ifc-mt)
 	target_compile_options(web-ifc-mt PUBLIC "-pthread")
-	set_target_properties(web-ifc-mt PROPERTIES LINK_FLAGS "${DEBUG_FLAG} -pthread -s PTHREAD_POOL_SIZE=navigator.hardwareConcurrency --bind -flto --define-macro=REAL_T_IS_DOUBLE -sSTACK_SIZE=5MB -s ALLOW_MEMORY_GROWTH=1 -s MAXIMUM_MEMORY=4GB -s EXPORT_NAME=WebIFCWasm -s MODULARIZE=1 -s ENVIRONMENT=web,worker")
+	set_target_properties(web-ifc-mt PROPERTIES LINK_FLAGS "${DEBUG_FLAG} -pthread -s PTHREAD_POOL_SIZE=navigator.hardwareConcurrency --bind -flto --define-macro=REAL_T_IS_DOUBLE -sSTACK_SIZE=5MB -s ALLOW_MEMORY_GROWTH=1 -s DYNAMIC_EXECUTION=0 -s MAXIMUM_MEMORY=4GB -s EXPORT_NAME=WebIFCWasm -s MODULARIZE=1 -s ENVIRONMENT=web,worker")
 endif()
 
 if(NOT EMSCRIPTEN)
+	include(GNUInstallDirs)
+	include(CMakePackageConfigHelpers)
+
 	# build web-ifc as a static library
 	add_library(web-ifc-library STATIC ${web-ifc-source})
 	param_setter(web-ifc-library)
+
+	# Add generator expressions for install support
+	target_include_directories(web-ifc-library PUBLIC
+		$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+		$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/web-ifc>
+		$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+		$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/web-ifc>
+	)
 
 	# build parameters for web-ifc-test
 	add_executable(web-ifc-test ${web-ifc-source} "./test/encoding_test.cpp" "./test/main.cpp" "./test/io_helpers.cpp")
@@ -139,4 +155,67 @@ if(NOT EMSCRIPTEN)
 		target_compile_options(web-ifc PUBLIC "-DCSG_DEBUG_OUTPUT")
 		target_compile_options(web-ifc PUBLIC "-DDEBUG_DUMP_SVG")
 	endif()
+
+	# Installation rules
+	# Install the static library
+	install(TARGETS web-ifc-library
+		EXPORT web-ifc-targets
+		ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+	)
+
+	# Install web-ifc headers
+	install(DIRECTORY web-ifc/
+		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/web-ifc
+		FILES_MATCHING PATTERN "*.h"
+	)
+
+	# Install version.h
+	install(FILES version.h
+		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/web-ifc
+	)
+
+	# Install bundled dependency headers (all header-only)
+	install(DIRECTORY ${fastfloat_SOURCE_DIR}/include/
+		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+	)
+	install(DIRECTORY ${tinynurbs_SOURCE_DIR}/include/
+		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+	)
+	install(DIRECTORY ${glm_SOURCE_DIR}/glm
+		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+	)
+	install(DIRECTORY ${earcut_SOURCE_DIR}/include/
+		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+	)
+	install(DIRECTORY ${cdt_SOURCE_DIR}/CDT/include/
+		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+	)
+	install(DIRECTORY ${spdlog_SOURCE_DIR}/include/
+		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+	)
+	install(DIRECTORY ${stduuid_SOURCE_DIR}/include/
+		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+	)
+	install(DIRECTORY ${unordered_dense_SOURCE_DIR}/include/
+		DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+	)
+
+	# Export targets with namespace
+	install(EXPORT web-ifc-targets
+		FILE web-ifc-targets.cmake
+		NAMESPACE web-ifc::
+		DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/web-ifc
+	)
+
+	# Generate and install CMake config file
+	configure_package_config_file(
+		${CMAKE_CURRENT_SOURCE_DIR}/cmake/web-ifc-config.cmake.in
+		${CMAKE_CURRENT_BINARY_DIR}/web-ifc-config.cmake
+		INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/web-ifc
+	)
+
+	install(FILES ${CMAKE_CURRENT_BINARY_DIR}/web-ifc-config.cmake
+		DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/web-ifc
+	)
 endif()

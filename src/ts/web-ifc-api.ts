@@ -341,6 +341,7 @@ export function ms() {
 }
 
 export type LocateFileHandlerFn = (path: string, prefix: string) => string;
+const MT_INIT_TIMEOUT_MS = 10000;
 
 export class IfcAPI {
   /** @ignore */
@@ -377,6 +378,7 @@ export class IfcAPI {
     customLocateFileHandler?: LocateFileHandlerFn,
     forceSingleThread: boolean = false
   ) {
+    let shouldRetrySingleThread = false;
     if (!WebIFCWasm) {
       if (
         typeof self !== "undefined" &&
@@ -385,6 +387,7 @@ export class IfcAPI {
       ) {
         try {
           WebIFCWasm = require("./web-ifc-mt");
+          shouldRetrySingleThread = true;
         } catch (ex) {
           WebIFCWasm = require(__WASM_PATH__);
         }
@@ -394,28 +397,54 @@ export class IfcAPI {
     if (WebIFCWasm && this.wasmModule == undefined) {
       let locateFileHandler: LocateFileHandlerFn = (path, prefix) => {
         // when the wasm module requests the wasm file, we redirect to include the user specified path
-        if (path.endsWith(".wasm")) {
-          if (this.isWasmPathAbsolute) {
-            return this.wasmPath + path;
-          }
-
-          return (
-            (currentScriptPath !== undefined ? currentScriptPath : prefix) +
-            this.wasmPath +
-            path
-          );
+        if (this.isWasmPathAbsolute) {
+          return this.wasmPath + path;
         }
-        // otherwise use the default path
+
         return (
-          (currentScriptPath !== undefined ? currentScriptPath : prefix) + path
+          (currentScriptPath !== undefined ? currentScriptPath : prefix) +
+          this.wasmPath +
+          path
         );
       };
 
-      //@ts-ignore
-      this.wasmModule = await WebIFCWasm({
-        noInitialRun: true,
-        locateFile: customLocateFileHandler || locateFileHandler,
-      });
+      try {
+        // @ts-ignore
+        const modulePromise = WebIFCWasm({
+          noInitialRun: true,
+          locateFile: customLocateFileHandler || locateFileHandler,
+        });
+        if (shouldRetrySingleThread) {
+          this.wasmModule = await Promise.race([
+            modulePromise,
+            new Promise((_, reject) =>
+              setTimeout(
+                () =>
+                  reject(
+                    new Error(
+                      `MT WASM init timed out after ${MT_INIT_TIMEOUT_MS}ms`
+                    )
+                  ),
+                MT_INIT_TIMEOUT_MS
+              )
+            ),
+          ]);
+        } else {
+          this.wasmModule = await modulePromise;
+        }
+      } catch (error) {
+        if (!shouldRetrySingleThread) throw error;
+        Log.warn(
+          "MT WASM init failed, retrying with single-thread module.",
+          error
+        );
+        WebIFCWasm = require(__WASM_PATH__);
+        // @ts-ignore
+        this.wasmModule = await WebIFCWasm({
+          noInitialRun: true,
+          locateFile: customLocateFileHandler || locateFileHandler,
+        });
+      }
       this.SetLogLevel(LogLevel.LOG_LEVEL_ERROR);
     } else {
       Log.error(
@@ -468,7 +497,7 @@ export class IfcAPI {
     for (var i = 0; i < SchemaNames.length; i++) {
       if (typeof SchemaNames[i] !== "undefined") {
         for (var j = 0; j < SchemaNames[i].length; j++) {
-          if (SchemaNames[i][j] == schemaName) return i;
+          if (SchemaNames[i][j] == schemaName.toUpperCase()) return i;
         }
       }
     }
@@ -1266,6 +1295,10 @@ export class IfcAPI {
         horizontal: horList,
         vertical: verList,
         curve3D: curve3DList,
+        FlattenedWorldTransformMatrix: this.GetWorldTransformMatrix(
+          modelID,
+          alignment.PlacementExpressId
+        ),
       };
       alignmentList.push(align);
     }
@@ -1295,7 +1328,15 @@ export class IfcAPI {
   GetCoordinationMatrix(modelID: number): Array<number> {
     return this.wasmModule.GetCoordinationMatrix(modelID) as Array<number>;
   }
-
+  GetWorldTransformMatrix(
+    modelID: number,
+    placementExpressId: number
+  ): Array<number> {
+    return this.wasmModule.GetWorldTransformMatrix(
+      modelID,
+      placementExpressId
+    ) as Array<number>;
+  }
   GetVertexArray(ptr: number, size: number): Float32Array {
     return this.getSubArray(this.wasmModule.HEAPF32, ptr, size);
   }

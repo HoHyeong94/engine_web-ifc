@@ -132,6 +132,7 @@ namespace webifc::geometry {
 			IfcAlignmentSegment Horizontal;
 			IfcAlignmentSegment Vertical;
 			IfcAlignmentSegment Absolute;
+			uint32_t PlacementExpressId;
 
 			void transform(glm::dmat4 coordinationMatrix)
 			{
@@ -229,7 +230,10 @@ namespace webifc::geometry {
 			}
 
 		};
-
+		/**
+		 * Represents a flattened mesh structure of an IfcComposedMesh, tracking geometries along with their respective colors and transformations.
+		 * This structure is provided to the client for rendering the geometries and their colors.
+		 */
 		struct IfcFlatMesh
 		{
 			std::vector<IfcPlacedGeometry> geometries;

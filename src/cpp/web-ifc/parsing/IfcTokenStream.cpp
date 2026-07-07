@@ -24,9 +24,14 @@ namespace webifc::parsing
     delete _fileStream;
   }
 
-  void IfcTokenStream::SetTokenSource(const std::function<uint32_t(char *, size_t, size_t)> &requestData) 
+  size_t IfcTokenStream::GetNoLines() {
+    if (_fileStream != nullptr) return _fileStream->GetNoLines();
+    return 0;
+  }
+
+  void IfcTokenStream::SetTokenSource(const std::function<uint32_t(char *, size_t, size_t)> &requestData, bool fromStream) 
   {
-      _fileStream = new IfcFileStream(requestData,_chunkSize);
+      _fileStream = new IfcFileStream(requestData,_chunkSize,fromStream);
       size_t tokenOffset=0;
       while (!_fileStream->IsAtEnd())
       {
@@ -44,7 +49,7 @@ namespace webifc::parsing
 
   void IfcTokenStream::SetTokenSource(std::istream &requestData)
   { 
-     SetTokenSource([&](char* dest, size_t sourceOffset, size_t destSize) { requestData.seekg(sourceOffset); requestData.read(dest, destSize); return requestData.gcount();});
+     SetTokenSource([&](char* dest, size_t sourceOffset, size_t destSize) { requestData.seekg(sourceOffset); requestData.read(dest, destSize); return requestData.gcount();},true);
   }
   
   std::string_view IfcTokenStream::ReadString() 
@@ -63,23 +68,7 @@ namespace webifc::parsing
       }
       return "";
   }
-  
-  void IfcTokenStream::Forward(const size_t size)
-  {
-      _readPtr+=size;
-       while (_readPtr >= _cChunk->TokenSize()) 
-      {
-        if (_currentChunk == _chunks.size()-1)
-        {
-          _readPtr = _chunks.back().TokenSize();
-          return;
-        }
-        _readPtr -= _cChunk->TokenSize();
-        _currentChunk++;
-        _cChunk = &_chunks[_currentChunk];
-      }
-  }
-  
+    
   void IfcTokenStream::MoveTo(const size_t pos)
   {
      for (size_t i=_chunks.size()-1; i >=0; i--)
@@ -133,25 +122,6 @@ namespace webifc::parsing
   {
     if (_chunks.size()==0) return 0;
     return _chunks.back().TokenSize() + _chunks.back().GetTokenRef();
-  }
-  
-  void IfcTokenStream::Back()
-  {
-      if (_readPtr == 0 ) 
-      {
-        if (_currentChunk > 0) 
-        {
-          _cChunk = &_chunks[--_currentChunk];
-          _readPtr=_cChunk->TokenSize()-1;
-          return;
-        }
-      }
-      _readPtr--;
-  }
-  
-  bool IfcTokenStream::IsAtEnd()
-  {
-     return _currentChunk >= _chunks.size()-1 && _readPtr >= _chunks.back().TokenSize();
   }
   
   size_t IfcTokenStream::GetReadOffset() 

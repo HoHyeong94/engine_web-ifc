@@ -85,7 +85,7 @@ tsSchema.push('if (Array.isArray(tapeItem)) tapeItem.map((p:any)=>TypeInitialise
 tsSchema.push('if (tapeItem.typecode) return TypeInitialisers[schema][tapeItem.typecode](tapeItem.value); return tapeItem.value;');
 tsSchema.push('}');
 tsSchema.push('function Labelise(tapeItem:any): any {');
-tsSchema.push('if ((tapeItem ?? undefined) === undefined || tapeItem instanceof Handle || tapeItem instanceof NumberHandle || tapeItem.label) return tapeItem;');
+tsSchema.push('if ((tapeItem ?? undefined) === undefined || tapeItem instanceof Handle || tapeItem.label) return tapeItem;');
 tsSchema.push('if (Array.isArray(tapeItem)) return tapeItem.map((p)=>Labelise(p));');
 tsSchema.push('const _valueName = tapeItem.type === 4 ? "internalValue" : "value";');
 tsSchema.push('return {[_valueName]:tapeItem[_valueName],valueType:tapeItem.type,type:2,label:tapeItem.name};');
@@ -354,7 +354,9 @@ cppSchema.push("#include <string>");
 cppSchema.push("#include \"ifc-schema.h\"");
 cppSchema.push("#include \"IfcSchemaManager.h\"");
 cppSchema.push("namespace webifc::schema {")
+
 cppSchema.push("void IfcSchemaManager::initSchemaData() {");
+for (const schemaAlias of schemaAliases) cppSchema.push(`_schemaMap["${schemaAlias.schemaName}"]="${schemaAlias.alias}";`);
 completeifcElementList.forEach(element => {
     cppSchema.push(`_ifcElements.insert(${element.toUpperCase()});`);
 });

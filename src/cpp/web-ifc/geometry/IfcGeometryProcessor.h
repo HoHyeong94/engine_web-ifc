@@ -9,6 +9,7 @@
 #include <cstdint>
 #include "representation/geometry.h"
 #include "../parsing/IfcLoader.h"
+#include "../cache/IfcCache.h"
 #include "../schema/IfcSchemaManager.h"
 #include "IfcGeometryLoader.h"
 
@@ -32,6 +33,7 @@ namespace webifc::geometry
     double TOLERANCE_PLANE_DEVIATION = 1.0E-04;
     double TOLERANCE_BACK_DEVIATION_DISTANCE = 1.0E-04;
     double TOLERANCE_INSIDE_OUTSIDE_PERIMETER = 1.0E-10;
+    double TOLERANCE_BOUNDING_BOX = 1.0E-02;
     uint16_t _BOOLEAN_UNION_THRESHOLD = 150;
   };
 
@@ -66,7 +68,7 @@ namespace webifc::geometry
     std::array<double, 16> GetFlatSpatialNodeMatrix(uint32_t expressID, bool isRelative);
 
   protected:
-    IfcGeometryProcessor(const IfcGeometrySettings &settings, std::unordered_map<uint32_t, IfcGeometry> expressIDToGeometry, const IfcGeometryLoader &geometryLoader, glm::dmat4 transformation, const parsing::IfcLoader &loader, booleanManager boolEngine, const schema::IfcSchemaManager &schemaManager, bool isCoordinated, uint32_t expressIdCyl, uint32_t expressIdRect, glm::dmat4 coordinationMatrix, IfcGeometry predefinedCylinder, IfcGeometry predefinedCube);
+    IfcGeometryProcessor(const IfcGeometrySettings &settings, std::unordered_map<uint32_t, IfcGeometry> expressIDToGeometry, glm::dmat4 transformation, const parsing::IfcLoader &loader, booleanManager boolEngine, const schema::IfcSchemaManager &schemaManager, bool isCoordinated, uint32_t expressIdCyl, uint32_t expressIdRect, glm::dmat4 coordinationMatrix, IfcGeometry predefinedCylinder, IfcGeometry predefinedCube);
     IfcGeometrySettings _settings;
     std::optional<glm::dvec4> GetStyleItemFromExpressId(uint32_t expressID);
     void AddFaceToGeometry(uint32_t expressID, IfcGeometry &geometry);
@@ -77,6 +79,7 @@ namespace webifc::geometry
     IfcGeometryLoader _geometryLoader;
     glm::dmat4 _transformation = glm::dmat4(1.0);
     const parsing::IfcLoader &_loader;
+    webifc::cache::IfcCache _cache;
     booleanManager _boolEngine;
     const schema::IfcSchemaManager &_schemaManager;
     bool _isCoordinated = false;
@@ -86,6 +89,7 @@ namespace webifc::geometry
     void AddComposedMeshToFlatMesh(IfcFlatMesh &flatMesh, const IfcComposedMesh &composedMesh, const glm::dmat4 &parentMatrix = glm::dmat4(1), const glm::dvec4 &color = glm::dvec4(1, 1, 1, 1), bool hasColor = false);
     std::vector<uint32_t> Read2DArrayOfThreeIndices();
     void ReadIndexedPolygonalFace(uint32_t expressID, std::vector<IfcBound3D> &bounds, const std::vector<glm::dvec3> &points);
+    void ApplyBooleanToMeshChildren(IfcComposedMesh &composedMesh, std::vector<IfcGeometry> &secondGroups, std::string op, IfcGeometrySettings _settings, glm::dmat4 mat);
     IfcGeometry _predefinedCylinder;
     IfcGeometry _predefinedCube;
     bool _useRelativePlacement = false;
