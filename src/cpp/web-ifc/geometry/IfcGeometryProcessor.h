@@ -23,6 +23,13 @@ namespace webifc::geometry
 
   // this class performs the processing of raw geometry data from the geometry loader to produce meshes
 
+  // gvcs-ifc: when set, B-spline surfaces are retained as parameters
+  // (IfcGeometry::nurbsFaces) and NOT triangulated. Process-global and
+  // DEFAULT ON — see the definition in IfcGeometryProcessor.cpp for why that
+  // default is a safety decision. Do not flip it to off.
+  void SetSkipBSplineTessellation(bool skip);
+  bool GetSkipBSplineTessellation();
+
   struct IfcGeometrySettings
   {
     bool _coordinateToOrigin = false;

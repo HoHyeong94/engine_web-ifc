@@ -17,6 +17,121 @@
 #include "operations/curve-utils.h"
 #include "operations/mesh_utils.h"
 #include "operations/boolean-utils/fuzzy-bools.h"
+#include <atomic>
+
+namespace
+{
+    // gvcs-ifc: copy a parsed B-spline surface into the OWNING per-face
+    // retention struct. Kept in one place because there are TWO tessellation
+    // sites — IFCFACESURFACE (GetMesh) and IFCADVANCEDFACE (AddFaceToGeometry)
+    // — and patching only one is silent: an IfcAdvancedBrep takes the SECOND
+    // path exclusively, so a capture on the first retains nothing at all for
+    // the corpus that actually needs it.
+    // gvcs-ifc: when set, B-spline surfaces are RETAINED as parameters and
+    // NOT triangulated.
+    //
+    // DEFAULT ON, and the default is a safety decision.
+    //
+    // `Nurbs::fill_geometry` subdivides every triangle three times with nothing
+    // in this engine bounding the result. On the two_towers Facade file (124 MB,
+    // 4,852 B-spline surfaces) that is 31,975,941 vertices and 610 MB of mesh
+    // from one file, and it has twice exhausted the memory of the machine
+    // building it. Retaining the surfaces instead costs 61,296 vertices and
+    // 19 MB for the same file.
+    //
+    // Defaulting to ON deliberately duplicates the Rust-side default in
+    // `mesh::nurbs_tessellation_skipped`: the engine must be safe even when
+    // nobody calls SetSkipBSplineTessellation at all, so that a new entry point
+    // that forgets to set the policy inherits the safe behaviour rather than
+    // the machine-killing one.
+    std::atomic<bool> g_skipBSplineTessellation{true};
+
+    // Retain one face's parameters, returning FALSE when they cannot be
+    // carried faithfully.
+    //
+    // The return value is what keeps the stored geometry complete. Retention
+    // and tessellation must cover every face EXACTLY ONCE: a face that is
+    // skipped here but then rejected downstream is in neither the stored
+    // surfaces nor the baked mesh, and it disappears with nothing to notice.
+    // So the decision is made HERE, where both outcomes are still available,
+    // and the caller tessellates whatever this refuses.
+    //
+    // The conditions mirror `NurbsFace::is_well_formed` on the Rust side, which
+    // is the consumer that would otherwise do the rejecting.
+    bool RetainBSplineFace(webifc::geometry::IfcGeometry &geom,
+                           const webifc::geometry::IfcSurface &surface,
+                           const std::vector<webifc::geometry::IfcBound3D> &bounds)
+    {
+        const auto &b = surface.BSplineSurface;
+
+        // A ragged control net desynchronises n_u/n_v from the payload.
+        const size_t n_u = b.ControlPoints.size();
+        const size_t n_v = n_u == 0 ? 0 : b.ControlPoints[0].size();
+        if (n_u == 0 || n_v == 0)
+            return false;
+        for (const auto &row : b.ControlPoints)
+            if (row.size() != n_v)
+                return false;
+
+        // Weights are either absent (non-rational) or a net-shaped grid.
+        // Anything else would be carried across as "non-rational" and
+        // re-export as the wrong IFC entity, so it is tessellated instead.
+        if (!b.Weights.empty())
+        {
+            if (b.Weights.size() != n_u)
+                return false;
+            for (const auto &row : b.Weights)
+                if (row.size() != n_v)
+                    return false;
+        }
+
+        // An IfcFaceSurface is a BOUNDED patch; with no trimming loop the
+        // stored face would evaluate to the whole surface.
+        bool bounded = false;
+        for (const auto &bd : bounds)
+            if (!bd.curve.points.empty())
+            {
+                bounded = true;
+                break;
+            }
+        if (!bounded)
+            return false;
+
+        webifc::geometry::BSplineFace f;
+        f.UDegree = b.UDegree;
+        f.VDegree = b.VDegree;
+        // Resolved to bool at capture — the source fields are string_views into
+        // the loader buffer and would dangle once retention outlives the parse.
+        f.ClosedU = (b.ClosedU == "T" || b.ClosedU == ".T.");
+        f.ClosedV = (b.ClosedV == "T" || b.ClosedV == ".T.");
+        f.ControlPoints = b.ControlPoints;
+        f.Weights = b.Weights;
+        f.UMultiplicity = b.UMultiplicity;
+        f.VMultiplicity = b.VMultiplicity;
+        f.UKnots = b.UKnots;
+        f.VKnots = b.VKnots;
+        // The trimming loops, copied out of the same `bounds` the tessellator
+        // would have consumed. Without them the patch is unbounded.
+        f.Bounds.reserve(bounds.size());
+        for (const auto &bd : bounds)
+        {
+            webifc::geometry::BSplineFace::Bound out;
+            out.Outer = (bd.type == webifc::geometry::IfcBoundType::OUTERBOUND);
+            out.Orientation = bd.orientation;
+            out.Points = bd.curve.points;
+            f.Bounds.push_back(std::move(out));
+        }
+        geom.nurbsFaces.push_back(std::move(f));
+        return true;
+    }
+}
+
+namespace webifc::geometry
+{
+    void SetSkipBSplineTessellation(bool skip) { g_skipBSplineTessellation.store(skip); }
+    bool GetSkipBSplineTessellation() { return g_skipBSplineTessellation.load(); }
+}
+
 
 namespace webifc::geometry
 {
@@ -692,7 +807,10 @@ namespace webifc::geometry
 
                 if (surface.BSplineSurface.Active)
                 {
-                    TriangulateBspline(geometry, bounds3D, surface, _cache.GetLinearScalingFactor());
+                    // Tessellate unless the face was BOTH retainable and skippable —
+                    // every face must end up in exactly one of the two forms.
+                    if (!RetainBSplineFace(geometry, surface, bounds3D) || !g_skipBSplineTessellation.load())
+                        TriangulateBspline(geometry, bounds3D, surface, _cache.GetLinearScalingFactor());
                 }
                 else if (surface.CylinderSurface.Active)
                 {
@@ -2038,7 +2156,14 @@ namespace webifc::geometry
 
             if (surface.BSplineSurface.Active)
             {
-                TriangulateBspline(geometry, bounds3D, surface, _cache.GetLinearScalingFactor());
+                // gvcs-ifc: retain the parametric surface. THIS is the path an
+                // IfcAdvancedBrep takes (IFCCLOSEDSHELL -> AddFaceToGeometry),
+                // and it writes into the SHARED brep geometry by reference — so
+                // no merge propagation is needed here.
+                // Tessellate unless the face was BOTH retainable and skippable —
+                // every face must end up in exactly one of the two forms.
+                if (!RetainBSplineFace(geometry, surface, bounds3D) || !g_skipBSplineTessellation.load())
+                    TriangulateBspline(geometry, bounds3D, surface, _cache.GetLinearScalingFactor());
             }
             else if (surface.CylinderSurface.Active)
             {

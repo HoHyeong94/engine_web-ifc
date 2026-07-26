@@ -69,9 +69,18 @@ namespace webifc::geometry {
 		const uint32_t *GetIndexDataRust();
 		size_t GetIndexDataSizeRust();
 		SweptDiskSolid GetSweptDiskSolid();
+		const std::vector<BSplineFace> &GetNurbsFaces() const { return nurbsFaces; }
 		Extrusion GetExtrusion();
 		glm::dmat4 Normalize();
 		SweptDiskSolid sweptDiskSolid;
+		// gvcs-ifc addition: parametric NURBS faces retained for this geometry.
+		// Per-FACE because an IfcAdvancedBrep is a set of IfcFaceSurface, each
+		// with its own surface. MUST be propagated by AddPart/AddGeometry/
+		// MergeGeometry — those copy FACES ONLY, which is exactly why
+		// `extrusion.Active` is silently lost whenever a boolean merges a
+		// geometry (the mechanism behind every wall-with-an-opening falling
+		// back to a baked mesh).
+		std::vector<BSplineFace> nurbsFaces;
 		// Parametric source retained when this geometry is a pure,
 		// boolean-free IFCEXTRUDEDAREASOLID (gvcs-ifc addition, mirrors
 		// the sweptDiskSolid precedent). Boolean/CSG results never carry

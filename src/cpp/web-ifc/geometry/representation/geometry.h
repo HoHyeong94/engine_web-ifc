@@ -106,6 +106,55 @@ namespace webifc::geometry {
 			std::vector<std::vector<glm::f64>> WeightPoints;
 		};
 
+		// gvcs-ifc addition: the parametric source of ONE B-spline (NURBS)
+		// face, retained so the surface can be STORED and tessellated by the
+		// client rather than baked into vertices here.
+		//
+		// Deliberately NOT a reuse of `BSpline` above: that struct holds
+		// `std::string_view` members pointing into the loader buffer, which
+		// dangle the moment retention outlives the parse. Everything here owns
+		// its storage, and the closure flags are resolved to bool at capture.
+		//
+		// This is per-FACE because an IfcAdvancedBrep is a set of
+		// IfcAdvancedFace/IfcFaceSurface, each with its own surface — so
+		// retention has to survive the face merge (see IfcGeometry::AddPart).
+		struct BSplineFace
+		{
+			double UDegree = 0;
+			double VDegree = 0;
+			bool ClosedU = false;
+			bool ClosedV = false;
+			// Control net, row-major [u][v]. `Weights` is parallel to it when
+			// the surface is rational, and EMPTY when it is not — the two cases
+			// re-export as different IFC entities, so the distinction is kept.
+			std::vector<std::vector<glm::dvec3>> ControlPoints;
+			std::vector<std::vector<double>> Weights;
+			std::vector<uint32_t> UMultiplicity;
+			std::vector<uint32_t> VMultiplicity;
+			std::vector<double> UKnots;
+			std::vector<double> VKnots;
+			// The face's TRIMMING loops, in the same space as the control net.
+			//
+			// Not optional: an IfcFaceSurface is a bounded PATCH of an
+			// unbounded surface. Without its bounds the stored face would
+			// evaluate to the whole surface — the wrong shape on screen, and
+			// no IFCFACEOUTERBOUND to re-emit on export. The engine's own
+			// tessellator reads exactly these (`Nurbs::get_uv_points`), so
+			// retaining them is what makes the stored form equivalent to the
+			// tessellation it replaces.
+			//
+			// `Outer` distinguishes IFCFACEOUTERBOUND from IFCFACEBOUND and
+			// `Orientation` is the loop's sense flag; both are carried through
+			// verbatim because export needs them.
+			struct Bound
+			{
+				bool Outer = false;
+				bool Orientation = true;
+				std::vector<glm::dvec3> Points;
+			};
+			std::vector<Bound> Bounds;
+		};
+
 		struct Revolution
 		{
 			bool Active = false;

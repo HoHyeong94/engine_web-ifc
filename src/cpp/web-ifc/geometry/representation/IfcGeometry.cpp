@@ -303,6 +303,10 @@ namespace webifc::geometry
 	void IfcGeometry::AddPart(IfcGeometry geom)
 	{
 		part.push_back(geom);
+			// Carry the parametric retention across the merge. Without this the
+		// faces arrive but their surfaces do not, and the brep silently
+		// degrades to a baked mesh — the same way extrusion.Active is lost.
+		nurbsFaces.insert(nurbsFaces.end(), geom.nurbsFaces.begin(), geom.nurbsFaces.end());
 	}
 
 	void IfcGeometry::AddPart(Geometry geom)
