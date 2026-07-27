@@ -401,6 +401,24 @@ function emitSchema(schemaName, entities, types) {
             p(`        })`);
         }
         p(`    }`);
+        // How many of THIS entity's enum slots hold a value outside the
+        // schema's set. Generated rather than reflected so the count is exact:
+        // it is the only way to find out whether the `Other` catch-all is
+        // load-bearing on real data or merely defensive.
+        {
+            const es = fields.filter((s) => enumNames.has(s.prop.type));
+            p(`    pub fn foreign_enums(&self) -> usize {`);
+            if (es.length === 0) {
+                p(`        0`);
+            } else {
+                const terms = es.map((s) =>
+                    s.prop.optional
+                        ? `self.${s.field}.as_ref().map_or(0, |e| e.is_foreign() as usize)`
+                        : `self.${s.field}.is_foreign() as usize`);
+                p(`        ${terms.join(' + ')}`);
+            }
+            p(`    }`);
+        }
         // to_arguments — port of generateTapeAssignment (DERIVE slot -> `*`)
         p(`    pub fn to_arguments(&self) -> Vec<IfcArgument> {`);
         p(`        let mut v: Vec<IfcArgument> = Vec::with_capacity(${argCount});`);
@@ -436,6 +454,12 @@ function emitSchema(schemaName, entities, types) {
     p(`    pub fn to_arguments(&self) -> Vec<IfcArgument> {`);
     p(`        match self {`);
     for (const en of emitted) p(`            AnyEntity::${en.name}(e) => e.to_arguments(),`);
+    p(`        }`);
+    p(`    }`);
+    p(`    /// Enum slots holding a value outside this schema's value set.`);
+    p(`    pub fn foreign_enums(&self) -> usize {`);
+    p(`        match self {`);
+    for (const en of emitted) p(`            AnyEntity::${en.name}(e) => e.foreign_enums(),`);
     p(`        }`);
     p(`    }`);
     p(`    pub fn type_code(&self) -> u32 {`);
