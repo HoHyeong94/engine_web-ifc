@@ -287,7 +287,16 @@ function emitSchema(schemaName, entities) {
             p(`pub struct ${rname} {}`);
         } else {
             p(`pub struct ${rname} {`);
-            for (const s of fields) p(`    pub ${s.field}: IfcValue,`);
+            for (const s of fields) {
+                // OPTIONALITY FROM THE SCHEMA. `prop.optional` was already
+                // computed (incl. the `SET [0:` inference) and then thrown
+                // away — every slot was emitted as a bare `IfcValue`, so a
+                // REQUIRED attribute could be silently omitted by anything
+                // constructing an entity. `Option<T>` vs `T` moves that to
+                // the type system, which is what a from-zero WRITER needs.
+                const ty = s.prop.optional ? 'Option<IfcValue>' : 'IfcValue';
+                p(`    pub ${s.field}: ${ty},`);
+            }
             p(`}`);
         }
         // impl
@@ -304,7 +313,18 @@ function emitSchema(schemaName, entities) {
         } else {
             p(`        Some(Self {`);
             slots.forEach((s, idx) => {
-                if (!s.derived) p(`            ${s.field}: IfcValue::from_arg(&a[${idx}]),`);
+                if (s.derived) return;
+                if (s.prop.optional) {
+                    // `$` -> None. Any other value -> Some. Reading stays
+                    // TOLERANT: an unexpected value in an optional slot is
+                    // kept, not rejected.
+                    p(`            ${s.field}: match IfcValue::from_arg(&a[${idx}]) {`);
+                    p(`                IfcValue::Null => None,`);
+                    p(`                v => Some(v),`);
+                    p(`            },`);
+                } else {
+                    p(`            ${s.field}: IfcValue::from_arg(&a[${idx}]),`);
+                }
             });
             p(`        })`);
         }
@@ -314,6 +334,9 @@ function emitSchema(schemaName, entities) {
         p(`        let mut v: Vec<IfcArgument> = Vec::with_capacity(${argCount});`);
         for (const s of slots) {
             if (s.derived) p(`        v.push(IfcValue::star_arg());`);
+            else if (s.prop.optional)
+                // None -> `$`, so the emitted bytes are unchanged.
+                p(`        v.push(self.${s.field}.as_ref().unwrap_or(&IfcValue::Null).to_arg());`);
             else p(`        v.push(self.${s.field}.to_arg());`);
         }
         p(`        v`);
