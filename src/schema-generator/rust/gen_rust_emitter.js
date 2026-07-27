@@ -248,7 +248,7 @@ function fieldIdent(name, used) {
 // ----------------------------------------------------------------------------
 // Emit one schema module
 // ----------------------------------------------------------------------------
-function emitSchema(schemaName, entities) {
+function emitSchema(schemaName, entities, types) {
     const out = [];
     const p = (s) => out.push(s);
 
@@ -259,6 +259,59 @@ function emitSchema(schemaName, entities) {
     p(`use crate::ffi::ffi::{IfcArgument, Line};`);
     p(`use super::IfcValue;`);
     p(``);
+
+    // ── ENUMERATIONS ────────────────────────────────────────────────────────
+    // The schema declares a CLOSED value set for each of these; the emitter used
+    // to keep them as `IfcValue::Enum(String)`, i.e. any string at all. As real
+    // Rust enums an invalid literal is unrepresentable, which is what a
+    // from-zero writer needs.
+    //
+    // `Other(String)` is deliberate: READING stays lenient, so a token this
+    // schema version does not know is preserved verbatim and round-trips rather
+    // than being dropped or rejected. Writing new data should never construct
+    // it — it exists to carry foreign input through untouched.
+    const enumTypes = (types || []).filter((t) => t.isEnum && t.values && t.values.length);
+    const enumNames = new Set(enumTypes.map((t) => t.name));
+    for (const t of enumTypes) {
+        const rn = rsIdent(t.name);
+        // No `Eq`: `Other` carries an `IfcValue`, which holds f64.
+        p(`#[derive(Clone, Debug, PartialEq)]`);
+        p(`pub enum ${rn} {`);
+        for (const v of t.values) p(`    ${v},`);
+        p(`    /// A value that is NOT one of this schema's tokens, kept in its`);
+        p(`    /// ORIGINAL form. It must carry the whole \`IfcValue\`, not just its`);
+        p(`    /// text: real files put a quoted STRING (\`'.BEND.'\`) in slots the`);
+        p(`    /// schema types as an enumeration, and re-emitting that as an enum`);
+        p(`    /// token produced \`..BEND..\` — 650 corpus lines regressed on exactly`);
+        p(`    /// that before this variant kept the kind as well as the text.`);
+        p(`    Other(IfcValue),`);
+        p(`}`);
+        p(`impl ${rn} {`);
+        p(`    pub fn from_literal(s: &str) -> Self {`);
+        p(`        match s {`);
+        for (const v of t.values) p(`            "${v}" => Self::${v},`);
+        p(`            other => Self::Other(IfcValue::Enum(other.to_string())),`);
+        p(`        }`);
+        p(`    }`);
+        p(`    pub fn as_literal(&self) -> &str {`);
+        p(`        match self {`);
+        for (const v of t.values) p(`            Self::${v} => "${v}",`);
+        p(`            Self::Other(_) => "",`);
+        p(`        }`);
+        p(`    }`);
+        p(`    /// The argument this value serialises to. A known token becomes an`);
+        p(`    /// enum literal; a foreign value is emitted EXACTLY as it arrived.`);
+        p(`    pub fn to_arg(&self) -> IfcArgument {`);
+        p(`        match self {`);
+        p(`            Self::Other(v) => v.to_arg(),`);
+        p(`            known => IfcValue::Enum(known.as_literal().to_string()).to_arg(),`);
+        p(`        }`);
+        p(`    }`);
+        p(`    /// True when this value came from OUTSIDE the schema's value set.`);
+        p(`    pub fn is_foreign(&self) -> bool { matches!(self, Self::Other(_)) }`);
+        p(`}`);
+        p(``);
+    }
 
     const seenCodes = new Map(); // typeCode -> entityName (collision guard)
     const emitted = [];          // { name, code }
@@ -282,7 +335,12 @@ function emitSchema(schemaName, entities) {
         const rname = rsIdent(e.name);
 
         // struct
-        p(`#[derive(Clone, Debug, Default)]`);
+        // NO `Default`. Once a REQUIRED enum slot is a real Rust enum there is
+        // no honest default for it — deriving one would have to invent a
+        // schema value, and a from-zero writer silently defaulting an
+        // attribute is exactly the failure this typing exists to prevent.
+        // Entities are built from `from_arguments` or explicitly, field by field.
+        p(`#[derive(Clone, Debug)]`);
         if (fields.length === 0) {
             p(`pub struct ${rname} {}`);
         } else {
@@ -294,7 +352,8 @@ function emitSchema(schemaName, entities) {
                 // REQUIRED attribute could be silently omitted by anything
                 // constructing an entity. `Option<T>` vs `T` moves that to
                 // the type system, which is what a from-zero WRITER needs.
-                const ty = s.prop.optional ? 'Option<IfcValue>' : 'IfcValue';
+                const base = enumNames.has(s.prop.type) ? rsIdent(s.prop.type) : 'IfcValue';
+                const ty = s.prop.optional ? `Option<${base}>` : base;
                 p(`    pub ${s.field}: ${ty},`);
             }
             p(`}`);
@@ -314,7 +373,20 @@ function emitSchema(schemaName, entities) {
             p(`        Some(Self {`);
             slots.forEach((s, idx) => {
                 if (s.derived) return;
-                if (s.prop.optional) {
+                const isEnumSlot = enumNames.has(s.prop.type);
+                const en = isEnumSlot ? rsIdent(s.prop.type) : null;
+                if (s.prop.optional && isEnumSlot) {
+                    p(`            ${s.field}: match IfcValue::from_arg(&a[${idx}]) {`);
+                    p(`                IfcValue::Null => None,`);
+                    p(`                IfcValue::Enum(t) => Some(${en}::from_literal(&t)),`);
+                    p(`                other => Some(${en}::Other(other)),`);
+                    p(`            },`);
+                } else if (isEnumSlot) {
+                    p(`            ${s.field}: match IfcValue::from_arg(&a[${idx}]) {`);
+                    p(`                IfcValue::Enum(t) => ${en}::from_literal(&t),`);
+                    p(`                other => ${en}::Other(other),`);
+                    p(`            },`);
+                } else if (s.prop.optional) {
                     // `$` -> None. Any other value -> Some. Reading stays
                     // TOLERANT: an unexpected value in an optional slot is
                     // kept, not rejected.
@@ -334,6 +406,13 @@ function emitSchema(schemaName, entities) {
         p(`        let mut v: Vec<IfcArgument> = Vec::with_capacity(${argCount});`);
         for (const s of slots) {
             if (s.derived) p(`        v.push(IfcValue::star_arg());`);
+            else if (enumNames.has(s.prop.type) && s.prop.optional)
+                p(`        v.push(match &self.${s.field} {`),
+                p(`            Some(e) => e.to_arg(),`),
+                p(`            None => IfcValue::Null.to_arg(),`),
+                p(`        });`);
+            else if (enumNames.has(s.prop.type))
+                p(`        v.push(self.${s.field}.to_arg());`);
             else if (s.prop.optional)
                 // None -> `$`, so the emitted bytes are unchanged.
                 p(`        v.push(self.${s.field}.as_ref().unwrap_or(&IfcValue::Null).to_arg());`);
@@ -422,7 +501,7 @@ function main() {
         entities.forEach((e) => walkParents(e, entities));
         entities = findSubClasses(entities);
 
-        const { text, count } = emitSchema(schema, entities);
+        const { text, count } = emitSchema(schema, entities, parsed.types);
         const outFile = path.join(outDir, `${schema.toLowerCase().replace(/\./g, "_")}.rs`);
         fs.writeFileSync(outFile, text, "utf8");
         const loc = text.split("\n").length;
