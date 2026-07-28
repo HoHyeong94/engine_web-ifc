@@ -315,6 +315,13 @@ function emitSchema(schemaName, entities, types) {
 
     const seenCodes = new Map(); // typeCode -> entityName (collision guard)
     const emitted = [];          // { name, code }
+    // (entity, slot) rows for every SCALAR enum-typed attribute, accumulated
+    // while `slots` is in scope (it is per-iteration) and emitted as the
+    // ENUM_SLOTS table after the loop. The export writer uses this to fill an
+    // empty enum slot with `.NOTDEFINED.` (or the enum's first literal when
+    // the enum has no NOTDEFINED) instead of `$` — owner directive 2026-07-28.
+    const enumValuesByName = new Map(enumTypes.map((t) => [t.name, t.values]));
+    const enumSlotRows = [];
 
     for (const e of entities) {
         const code = crc32(e.name.toUpperCase());
@@ -442,6 +449,17 @@ function emitSchema(schemaName, entities, types) {
         p(``);
 
         emitted.push({ name: rname, code, origName: e.name, argCount });
+        slots.forEach((s, idx) => {
+            if (s.derived || s.prop.set) return;
+            if (!enumNames.has(s.prop.type)) return;
+            enumSlotRows.push({
+                entity: e.name.toUpperCase(),
+                idx,
+                propName: s.prop.name,
+                enumType: s.prop.type,
+                optional: s.prop.optional,
+            });
+        });
     }
 
     // AnyEntity wrapper enum + dispatch
@@ -504,6 +522,18 @@ function emitSchema(schemaName, entities, types) {
     p(`    }`);
     p(`}`);
     p(``);
+    // (entity, parent) pairs — the raw SUBTYPE OF chains from the .exp. The
+    // cross-version mapping (IFC2X3 class -> nearest ancestor that still
+    // exists in IFC4) is DERIVED from these two tables at runtime and pinned
+    // by a diffable golden, never hand-maintained (owner requirement).
+    p(`/// (entity name, parent name) — the .exp SUBTYPE OF chain. Root
+/// entities are omitted.`);
+    p(`pub static ENTITY_PARENTS: &[(&str, &str)] = &[`);
+    for (const e of entities) {
+        if (e.parent) p(`    ("${e.name}", "${e.parent}"),`);
+    }
+    p(`];`);
+    p(``);
     // Every generated type code, so a consumer can BUILD reverse lookups
     // (name -> code, code -> arity) without linking the C++ engine. The
     // export writer is the consumer: it must resolve a stored class name to
@@ -515,6 +545,30 @@ function emitSchema(schemaName, entities, types) {
     p(``);
     p(`/// Number of generated entity classes for this schema.`);
     p(`pub const ENTITY_COUNT: usize = ${emitted.length};`);
+    p(``);
+    // Enum literal sets, one row per ENUMERATION type, literal order as
+    // declared in the .exp. The writer resolves a STORED enum string against
+    // this (strict-on-write: only schema literals are emitted) and picks the
+    // fill for an empty slot: NOTDEFINED when the enum has it, else the
+    // first literal.
+    p(`/// (enum type name, its literals in .exp declaration order).`);
+    p(`pub static ENUM_VALUES: &[(&str, &[&str])] = &[`);
+    for (const t of enumTypes) {
+        p(`    ("${t.name}", &[${t.values.map((v) => `"${v}"`).join(", ")}]),`);
+    }
+    p(`];`);
+    p(``);
+    // Scalar enum-typed attribute slots over the FULL inherited argument
+    // order — the writer's answer to "which '$' paddings are really enum
+    // slots". SET/LIST-of-enum and DERIVE slots are excluded (a list slot
+    // has no single default; a derived slot serialises as '*').
+    p(`/// (ENTITY NAME UPPERCASE, zero-based STEP slot, attribute name,`);
+    p(`/// enum type name, attribute is OPTIONAL).`);
+    p(`pub static ENUM_SLOTS: &[(&str, u16, &str, &str, bool)] = &[`);
+    for (const r of enumSlotRows) {
+        p(`    ("${r.entity}", ${r.idx}, "${r.propName}", "${r.enumType}", ${r.optional}),`);
+    }
+    p(`];`);
     p(``);
 
     return { text: out.join("\n") + "\n", count: emitted.length };
