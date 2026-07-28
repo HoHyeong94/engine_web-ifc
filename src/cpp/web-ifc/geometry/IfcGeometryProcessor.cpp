@@ -46,6 +46,30 @@ namespace
     // the machine-killing one.
     std::atomic<bool> g_skipBSplineTessellation{true};
 
+    // gvcs-ifc: when set, GetMesh does NOT subtract IfcRelVoidsElement
+    // openings from their host — the host mesh comes back UNCUT (pre-boolean),
+    // exactly as its own representation defines it. Openings keep their own
+    // geometry either way, so the boolean can be re-done downstream (viewer
+    // CSG / clipping) or re-expressed on export as IfcRelVoidsElement lines.
+    //
+    // DEFAULT OFF = subtract, the engine's historical behaviour, so a caller
+    // that never touches the switch sees no change. Read at GetMesh time, so
+    // one open model can be streamed twice, once cut and once uncut (the
+    // gvcs-ifc wrapper clears the geometry cache per element, so no stale
+    // mesh survives the flip).
+    //
+    // THREAD_LOCAL, deliberately unlike the B-spline switch above. That one
+    // is set once per process and never toggled, so a global is safe. This
+    // one is FLIPPED AROUND EVERY HOST'S ORIGIN PASS — with gvcs-core's
+    // multi-file ingest pool (each thread owns a private thread_local
+    // ModelManager), a process-global toggle let thread A's origin pass turn
+    // the boolean off under thread B's CUT pass: B's host collected UNCUT,
+    // deduped against the origin blob, and one `_geom` part silently
+    // vanished. `parallel_ingest_matches_sequential` caught it as a 79-vs-78
+    // part count. Per-thread state matches the wrapper's thread-confinement
+    // contract exactly.
+    thread_local bool g_skipRelVoidsBoolean = false;
+
     // Retain one face's parameters, returning FALSE when they cannot be
     // carried faithfully.
     //
@@ -130,6 +154,8 @@ namespace webifc::geometry
 {
     void SetSkipBSplineTessellation(bool skip) { g_skipBSplineTessellation.store(skip); }
     bool GetSkipBSplineTessellation() { return g_skipBSplineTessellation.load(); }
+    void SetSkipRelVoidsBoolean(bool skip) { g_skipRelVoidsBoolean = skip; }
+    bool GetSkipRelVoidsBoolean() { return g_skipRelVoidsBoolean; }
 }
 
 
@@ -340,7 +366,11 @@ namespace webifc::geometry
             }
 
             auto relVoidsIt = relVoids.find(expressID);
-            if (relVoidsIt != relVoids.end() && !relVoidsIt->second.empty())
+            // gvcs-ifc: the whole subtraction is skippable — see
+            // g_skipRelVoidsBoolean at the top of this file. When skipped the
+            // host falls through to the plain-mesh path below, exactly as if
+            // it had no voids.
+            if (relVoidsIt != relVoids.end() && !relVoidsIt->second.empty() && !g_skipRelVoidsBoolean)
             {
                 auto origin = GetOrigin(mesh, _expressIDToGeometry);
                 auto normalizeMat = glm::translate(-origin);

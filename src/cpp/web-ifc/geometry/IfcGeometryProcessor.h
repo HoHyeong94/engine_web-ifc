@@ -30,6 +30,15 @@ namespace webifc::geometry
   void SetSkipBSplineTessellation(bool skip);
   bool GetSkipBSplineTessellation();
 
+  // gvcs-ifc: when set, IfcRelVoidsElement openings are NOT subtracted from
+  // their host mesh — hosts come back UNCUT (pre-boolean). Default OFF
+  // (= subtract, the historical behaviour). Read at GetMesh time, so the same
+  // open model can be streamed cut and uncut in turn. THREAD-LOCAL — the
+  // switch toggles around every host's origin pass, and a process-global
+  // toggle raced parallel ingest threads (see the definition).
+  void SetSkipRelVoidsBoolean(bool skip);
+  bool GetSkipRelVoidsBoolean();
+
   struct IfcGeometrySettings
   {
     bool _coordinateToOrigin = false;

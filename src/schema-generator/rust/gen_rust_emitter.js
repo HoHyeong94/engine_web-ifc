@@ -441,7 +441,7 @@ function emitSchema(schemaName, entities, types) {
         p(`}`);
         p(``);
 
-        emitted.push({ name: rname, code, origName: e.name });
+        emitted.push({ name: rname, code, origName: e.name, argCount });
     }
 
     // AnyEntity wrapper enum + dispatch
@@ -491,6 +491,27 @@ function emitSchema(schemaName, entities, types) {
     p(`        _ => None,`);
     p(`    }`);
     p(`}`);
+    p(``);
+    // arity_of table — the flattened (inherited + own) attribute count per
+    // entity, i.e. exactly the N that from_arguments gates on. The EXPORT
+    // writer pads a class line to this arity instead of hand-maintaining 776
+    // entity shapes; a wrong count here would already have broken import.
+    p(`/// type_code -> flattened attribute count (generated entities only).`);
+    p(`pub fn arity_of(type_code: u32) -> Option<usize> {`);
+    p(`    match type_code {`);
+    for (const en of emitted) p(`        ${en.code} => Some(${en.argCount}),`);
+    p(`        _ => None,`);
+    p(`    }`);
+    p(`}`);
+    p(``);
+    // Every generated type code, so a consumer can BUILD reverse lookups
+    // (name -> code, code -> arity) without linking the C++ engine. The
+    // export writer is the consumer: it must resolve a stored class name to
+    // (type_code, arity) with no model open.
+    p(`/// Every generated entity type code, in emission order.`);
+    p(`pub static ENTITY_CODES: &[u32] = &[`);
+    for (const en of emitted) p(`    ${en.code},`);
+    p(`];`);
     p(``);
     p(`/// Number of generated entity classes for this schema.`);
     p(`pub const ENTITY_COUNT: usize = ${emitted.length};`);
