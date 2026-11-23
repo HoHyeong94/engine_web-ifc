@@ -7,11 +7,14 @@
 #include <vector>
 #include <stack>
 #include <cstdint>
+#include <cmath>
 #include <memory>
 #include <emscripten/bind.h>
 #include <spdlog/spdlog.h>
+#include <limits>
 #include "../web-ifc/modelmanager/ModelManager.h"
 #include "../version.h"
+#include "../web-ifc/parsing/StepBinary.h"
 #include "../web-ifc/geometry/operations/bim-geometry/extrusion.h"
 #include "../web-ifc/geometry/operations/bim-geometry/sweep.h"
 #include "../web-ifc/geometry/operations/bim-geometry/circularSweep.h"
@@ -59,7 +62,11 @@ int OpenModel(webifc::manager::LoaderSettings settings, emscripten::val callback
         return len;
     };
 
-    manager.GetIfcLoader(modelID)->LoadFile(loaderFunc);
+    if (!manager.GetIfcLoader(modelID)->LoadFile(loaderFunc))
+    {
+        manager.CloseModel(modelID);
+        return -1;
+    }
     return modelID;
 }
 
@@ -76,22 +83,46 @@ int GetModelSize(uint32_t modelID)
     return manager.IsModelOpen(modelID) ? manager.GetIfcLoader(modelID)->GetTotalSize() : 0;
 }
 
+#ifdef BREP_ENGINE
+// The brep kernel as an alternative geometry engine, one per open model.
+#include "../brep/ifc_reader.h"
+static std::unordered_map<uint32_t, std::unique_ptr<brep::ifc::BrepEngine>> brepEngines;
+static brep::ifc::BrepEngine* BrepEngineOf(uint32_t modelID)
+{
+    auto it = brepEngines.find(modelID);
+    if (it != brepEngines.end()) return it->second.get();
+    auto engine = std::make_unique<brep::ifc::BrepEngine>(*manager.GetIfcLoader(modelID), manager.GetSchemaManager(), *manager.GetGeometryProcessor(modelID));
+    auto* raw = engine.get();
+    brepEngines.emplace(modelID, std::move(engine));
+    return raw;
+}
+// The brep engine on booleans only (see BrepEngine::booleansOnly): web-ifc meshes the rest.
+void SetBrepBooleansOnly(uint32_t modelID, bool on)
+{
+    if (!manager.IsModelOpen(modelID)) return;
+    BrepEngineOf(modelID)->booleansOnly = on;
+}
+#endif
+
 void CloseModel(uint32_t modelID)
 {
+#ifdef BREP_ENGINE
+    brepEngines.erase(modelID);
+#endif
     return manager.CloseModel(modelID);
 }
 
-webifc::geometry::IfcFlatMesh GetFlatMesh(uint32_t modelID, uint32_t expressID)
+webifc::geometry::IfcFlatMesh GetFlatMesh(uint32_t modelID, uint32_t expressID, bool applyLinearScalingFactor = true)
 {
     if (!manager.IsModelOpen(modelID))
         return {};
-    webifc::geometry::IfcFlatMesh mesh = manager.GetGeometryProcessor(modelID)->GetFlatMesh(expressID);
+    webifc::geometry::IfcFlatMesh mesh = manager.GetGeometryProcessor(modelID)->GetFlatMesh(expressID, applyLinearScalingFactor);
     for (auto &geom : mesh.geometries)
         manager.GetGeometryProcessor(modelID)->GetGeometry(geom.geometryExpressID).GetVertexData();
     return mesh;
 }
 
-void StreamMeshes(uint32_t modelID, const std::vector<uint32_t> &expressIds, emscripten::val callback)
+void StreamMeshes(uint32_t modelID, const std::vector<uint32_t> &expressIds, emscripten::val callback, bool applyLinearScalingFactor = true)
 {
     if (!manager.IsModelOpen(modelID))
         return;
@@ -102,7 +133,7 @@ void StreamMeshes(uint32_t modelID, const std::vector<uint32_t> &expressIds, ems
     for (const auto &id : expressIds)
     {
         // read the mesh from IFC
-        webifc::geometry::IfcFlatMesh mesh = geomLoader->GetFlatMesh(id);
+        webifc::geometry::IfcFlatMesh mesh = geomLoader->GetFlatMesh(id, applyLinearScalingFactor);
 
         // prepare the geometry data
         for (auto &geom : mesh.geometries)
@@ -118,13 +149,13 @@ void StreamMeshes(uint32_t modelID, const std::vector<uint32_t> &expressIds, ems
         }
 
         // clear geometry, freeing memory, client is expected to have consumed the data
-        geomLoader->Clear();
+        geomLoader->Clear(true);
 
         index++;
     }
 }
 
-void StreamMeshesWithExpressID(uint32_t modelID, emscripten::val expressIdsVal, emscripten::val callback)
+void StreamMeshesWithExpressID(uint32_t modelID, emscripten::val expressIdsVal, emscripten::val callback, bool applyLinearScalingFactor = true)
 {
     std::vector<uint32_t> expressIds;
 
@@ -138,10 +169,10 @@ void StreamMeshesWithExpressID(uint32_t modelID, emscripten::val expressIdsVal, 
         expressIds.push_back(expressId);
     }
 
-    StreamMeshes(modelID, expressIds, callback);
+    StreamMeshes(modelID, expressIds, callback, applyLinearScalingFactor);
 }
 
-void StreamAllMeshesWithTypes(uint32_t modelID, const std::vector<uint32_t> &types, emscripten::val callback)
+void StreamAllMeshesWithTypes(uint32_t modelID, const std::vector<uint32_t> &types, emscripten::val callback, bool applyLinearScalingFactor = true)
 {
     if (!manager.IsModelOpen(modelID))
         return;
@@ -150,11 +181,11 @@ void StreamAllMeshesWithTypes(uint32_t modelID, const std::vector<uint32_t> &typ
     for (auto &type : types)
     {
         auto elements = loader->GetExpressIDsWithType(type);
-        StreamMeshes(modelID, elements, callback);
+        StreamMeshes(modelID, elements, callback, applyLinearScalingFactor);
     }
 }
 
-void StreamAllMeshesWithTypesVal(uint32_t modelID, emscripten::val typesVal, emscripten::val callback)
+void StreamAllMeshesWithTypesVal(uint32_t modelID, emscripten::val typesVal, emscripten::val callback, bool applyLinearScalingFactor = true)
 {
     if (!manager.IsModelOpen(modelID))
         return;
@@ -167,10 +198,10 @@ void StreamAllMeshesWithTypesVal(uint32_t modelID, emscripten::val typesVal, ems
         uint32_t type = typeVal.as<uint32_t>();
         types.push_back(type);
     }
-    StreamAllMeshesWithTypes(modelID, types, callback);
+    StreamAllMeshesWithTypes(modelID, types, callback, applyLinearScalingFactor);
 }
 
-void StreamAllMeshes(uint32_t modelID, emscripten::val callback)
+void StreamAllMeshes(uint32_t modelID, emscripten::val callback, bool applyLinearScalingFactor = true)
 {
     if (!manager.IsModelOpen(modelID))
         return;
@@ -185,10 +216,74 @@ void StreamAllMeshes(uint32_t modelID, emscripten::val callback)
 
         types.push_back(type);
     }
-    StreamAllMeshesWithTypes(modelID, types, callback);
+    StreamAllMeshesWithTypes(modelID, types, callback, applyLinearScalingFactor);
 }
 
-std::vector<webifc::geometry::IfcFlatMesh> LoadAllGeometry(uint32_t modelID)
+#ifdef BREP_ENGINE
+// As StreamMeshes, with the brep engine: the callback gets (mesh, shells, index, total). Each shell is
+// { id, points: Float64Array, rings: Int32Array } viewing wasm memory, alive for the callback only.
+// Geometries of the mesh that have a shell come with no vertices.
+void StreamBrepMeshes(uint32_t modelID, const std::vector<uint32_t> &expressIds, emscripten::val callback)
+{
+    if (!manager.IsModelOpen(modelID))
+        return;
+    auto geomLoader = manager.GetGeometryProcessor(modelID);
+    auto* engine = BrepEngineOf(modelID);
+    std::vector<brep::ifc::EngineShell> shells;
+    int index = 0;
+    int total = expressIds.size();
+    for (const auto &id : expressIds)
+    {
+        webifc::geometry::IfcFlatMesh mesh;
+        engine->flatMesh(id, &mesh, shells);
+        for (auto &geom : mesh.geometries)
+            geomLoader->GetGeometry(geom.geometryExpressID).GetVertexData();
+        if (!mesh.geometries.empty())
+        {
+            emscripten::val list = emscripten::val::array();
+            // Copied into arrays JS owns: a view on the heap is detached as soon as passing the mesh
+            // to the callback (or anything after) grows the memory.
+            static const emscripten::val Float64Array = emscripten::val::global("Float64Array");
+            static const emscripten::val Int32Array = emscripten::val::global("Int32Array");
+            for (auto &s : shells)
+            {
+                emscripten::val o = emscripten::val::object();
+                o.set("id", s.geometryExpressID);
+                o.set("points", Float64Array.new_(emscripten::typed_memory_view(s.points.size(), s.points.data())));
+                o.set("rings", Int32Array.new_(emscripten::typed_memory_view(s.rings.size(), s.rings.data())));
+                list.call<void>("push", o);
+            }
+            callback(mesh, list, index, total);
+        }
+        geomLoader->Clear();
+        index++;
+    }
+}
+
+void StreamBrepMeshesWithExpressID(uint32_t modelID, emscripten::val expressIdsVal, emscripten::val callback)
+{
+    std::vector<uint32_t> expressIds;
+    uint32_t size = expressIdsVal["length"].as<uint32_t>();
+    for (size_t i = 0; i < size; i++)
+        expressIds.push_back(expressIdsVal[std::to_string(i)].as<uint32_t>());
+    StreamBrepMeshes(modelID, expressIds, callback);
+}
+
+void StreamAllBrepMeshes(uint32_t modelID, emscripten::val callback)
+{
+    if (!manager.IsModelOpen(modelID))
+        return;
+    auto loader = manager.GetIfcLoader(modelID);
+    for (auto &type : manager.GetSchemaManager().GetIfcElementList())
+    {
+        if (type == webifc::schema::IFCOPENINGELEMENT || type == webifc::schema::IFCSPACE || type == webifc::schema::IFCOPENINGSTANDARDCASE)
+            continue;
+        StreamBrepMeshes(modelID, loader->GetExpressIDsWithType(type), callback);
+    }
+}
+#endif
+
+std::vector<webifc::geometry::IfcFlatMesh> LoadAllGeometry(uint32_t modelID, bool applyLinearScalingFactor = true)
 {
     if (!manager.IsModelOpen(modelID))
         return std::vector<webifc::geometry::IfcFlatMesh>();
@@ -207,7 +302,7 @@ std::vector<webifc::geometry::IfcFlatMesh> LoadAllGeometry(uint32_t modelID)
 
         for (uint32_t i = 0; i < elements.size(); i++)
         {
-            webifc::geometry::IfcFlatMesh mesh = geomLoader->GetFlatMesh(elements[i]);
+            webifc::geometry::IfcFlatMesh mesh = geomLoader->GetFlatMesh(elements[i], applyLinearScalingFactor);
             for (auto &geom : mesh.geometries)
             {
                 auto &flatGeom = geomLoader->GetGeometry(geom.geometryExpressID);
@@ -417,13 +512,148 @@ std::vector<uint32_t> GetAllLines(uint32_t modelID)
     return manager.IsModelOpen(modelID) ? manager.GetIfcLoader(modelID)->GetAllLines() : std::vector<uint32_t>();
 }
 
+// The tape stores encoded STRING lengths as uint16_t. Validate before changing it.
+bool EncodeStringValue(const emscripten::val &value, std::string &text)
+{
+    if (!value.isString()) return false;
+    std::ostringstream encoded;
+    webifc::parsing::p21encode(value.as<std::string>(), encoded);
+    text = encoded.str();
+    return text.size() <= std::numeric_limits<uint16_t>::max();
+}
+
+bool ValidateStringArguments(const emscripten::val &value)
+{
+    if (value.isString())
+    {
+        std::string encoded;
+        return EncodeStringValue(value, encoded);
+    }
+    if (value.isArray())
+    {
+        for (uint32_t i = 0; i < value["length"].as<uint32_t>(); ++i)
+            if (!ValidateStringArguments(value[std::to_string(i)])) return false;
+    }
+    else if (!value.isNull() && !value.isUndefined() && value.typeOf().as<std::string>() == "object")
+    {
+        const auto type = value["type"];
+        if (!type.isNumber()) return true;
+        const auto token = static_cast<webifc::parsing::IfcTokenType>(type.as<uint32_t>());
+        const bool string = token == webifc::parsing::IfcTokenType::STRING ||
+            (token == webifc::parsing::IfcTokenType::LABEL && value["valueType"].isNumber() &&
+             value["valueType"].as<uint32_t>() == webifc::parsing::IfcTokenType::STRING);
+        const auto payload = value["value"];
+        if (string)
+        {
+            std::string encoded;
+            if (payload.isArray())
+            {
+                if (token != webifc::parsing::IfcTokenType::STRING) return false;
+                for (uint32_t i = 0; i < payload["length"].as<uint32_t>(); ++i)
+                    if (!EncodeStringValue(payload[std::to_string(i)], encoded)) return false;
+            }
+            else if (!EncodeStringValue(payload, encoded)) return false;
+        }
+        else if (payload.isArray() && !ValidateStringArguments(payload)) return false;
+    }
+    return true;
+}
+
+bool IsSafeInteger(const emscripten::val &value)
+{
+    if (!value.isNumber()) return false;
+    const double number = value.as<double>();
+    return std::isfinite(number) && std::floor(number) == number && std::abs(number) <= 9007199254740991.0;
+}
+
+// Validate integer payloads before appending any tokens or replacing a line's tape offset.
+bool ValidateIntegerArguments(const emscripten::val &value)
+{
+    if (value.isArray())
+    {
+        const uint32_t size = value["length"].as<uint32_t>();
+        for (uint32_t i = 0; i < size; ++i)
+            if (!ValidateIntegerArguments(value[std::to_string(i)])) return false;
+    }
+    else if (!value.isNull() && !value.isUndefined() && value.typeOf().as<std::string>() == "object")
+    {
+        const auto type = value["type"];
+        if (!type.isNumber()) return true;
+        const auto token = static_cast<webifc::parsing::IfcTokenType>(type.as<uint32_t>());
+        const bool integer = token == webifc::parsing::IfcTokenType::INTEGER ||
+            (token == webifc::parsing::IfcTokenType::LABEL && value["valueType"].isNumber() &&
+             value["valueType"].as<uint32_t>() == webifc::parsing::IfcTokenType::INTEGER);
+        const auto payload = value["value"];
+        if (integer)
+        {
+            if (!payload.isArray()) return IsSafeInteger(payload);
+            const uint32_t size = payload["length"].as<uint32_t>();
+            for (uint32_t i = 0; i < size; ++i)
+                if (!IsSafeInteger(payload[std::to_string(i)])) return false;
+        }
+        else if (payload.isArray()) return ValidateIntegerArguments(payload);
+    }
+    return true;
+}
+
+bool IsBinaryValue(const emscripten::val &value)
+{
+    return value.isString() && webifc::parsing::IsValidStepBinary(value.as<std::string>());
+}
+
+// Validate binary payloads before appending any tokens or replacing a line's tape offset.
+bool ValidateBinaryArguments(const emscripten::val &value)
+{
+    if (value.isArray())
+    {
+        const uint32_t size = value["length"].as<uint32_t>();
+        for (uint32_t i = 0; i < size; ++i)
+            if (!ValidateBinaryArguments(value[std::to_string(i)])) return false;
+    }
+    else if (!value.isNull() && !value.isUndefined() && value.typeOf().as<std::string>() == "object")
+    {
+        const auto type = value["type"];
+        if (!type.isNumber()) return true;
+        const auto token = static_cast<webifc::parsing::IfcTokenType>(type.as<uint32_t>());
+        const bool binary = token == webifc::parsing::IfcTokenType::BINARY ||
+            (token == webifc::parsing::IfcTokenType::LABEL && value["valueType"].isNumber() &&
+             value["valueType"].as<uint32_t>() == webifc::parsing::IfcTokenType::BINARY);
+        const auto payload = value["value"];
+        if (binary)
+        {
+            if (!payload.isArray()) return IsBinaryValue(payload);
+            const uint32_t size = payload["length"].as<uint32_t>();
+            for (uint32_t i = 0; i < size; ++i)
+                if (!IsBinaryValue(payload[std::to_string(i)])) return false;
+        }
+        else if (payload.isArray()) return ValidateBinaryArguments(payload);
+    }
+    return true;
+}
+
 bool WriteValue(uint32_t modelID, webifc::parsing::IfcTokenType t, emscripten::val value)
 {
     bool responseCode = true;
     auto loader = manager.GetIfcLoader(modelID);
     switch (t)
     {
+    case webifc::parsing::IfcTokenType::BINARY:
+    {
+        if (!IsBinaryValue(value)) return false;
+        std::string text = value.as<std::string>();
+        std::transform(text.begin(), text.end(), text.begin(), webifc::parsing::CanonicalBinaryDigit);
+        loader->Push<uint16_t>(static_cast<uint16_t>(text.size()));
+        loader->Push((void*)text.data(), text.size());
+        break;
+    }
     case webifc::parsing::IfcTokenType::STRING:
+    {
+        std::string text;
+        if (!EncodeStringValue(value, text)) return false;
+        loader->Push<uint16_t>(static_cast<uint16_t>(text.size()));
+        loader->Push((void*)text.data(), text.size());
+        break;
+    }
     case webifc::parsing::IfcTokenType::ENUM:
     {
         std::string copy;
@@ -460,8 +690,8 @@ bool WriteValue(uint32_t modelID, webifc::parsing::IfcTokenType t, emscripten::v
     }
     case webifc::parsing::IfcTokenType::INTEGER:
     {
-        int val = value.as<int>();
-        loader->PushInt(val);
+        if (!IsSafeInteger(value)) return false;
+        loader->PushInt(static_cast<int64_t>(value.as<double>()));
         break;
     }
     default:
@@ -487,7 +717,7 @@ bool WriteSet(uint32_t modelID, emscripten::val &val)
         else if (child.isUndefined())
             loader->Push<uint8_t>(webifc::parsing::IfcTokenType::UNKNOWN);
         else if (child.isArray())
-            WriteSet(modelID, child);
+            responseCode = WriteSet(modelID, child) && responseCode;
         else if (child["value"].isArray())
         {
             emscripten::val innerVal = child["value"];
@@ -497,10 +727,13 @@ bool WriteSet(uint32_t modelID, emscripten::val &val)
             for (size_t z = 0; z < sz; z++)
             {
                 loader->Push<uint8_t>(type);
-                if (type == webifc::parsing::IfcTokenType::INTEGER)
+                if (type == webifc::parsing::IfcTokenType::BINARY || type == webifc::parsing::IfcTokenType::STRING)
                 {
-                    int value = innerVal[std::to_string(z)].as<int>();
-                    loader->PushInt(value);
+                    responseCode = WriteValue(modelID, type, innerVal[std::to_string(z)]) && responseCode;
+                }
+                else if (type == webifc::parsing::IfcTokenType::INTEGER)
+                {
+                    if (!WriteValue(modelID, type, innerVal[std::to_string(z)])) responseCode = false;
                 }
                 else
                 {
@@ -544,7 +777,7 @@ bool WriteSet(uint32_t modelID, emscripten::val &val)
                 loader->Push<uint8_t>(webifc::parsing::IfcTokenType::SET_BEGIN);
 
                 loader->Push<uint8_t>(valueType);
-                WriteValue(modelID, valueType, value);
+                responseCode = WriteValue(modelID, valueType, value) && responseCode;
 
                 loader->Push<uint8_t>(webifc::parsing::IfcTokenType::SET_END);
 
@@ -552,15 +785,16 @@ bool WriteSet(uint32_t modelID, emscripten::val &val)
             }
             case webifc::parsing::IfcTokenType::REAL:
             {
-                WriteValue(modelID, type, child["internalValue"]);
+                responseCode = WriteValue(modelID, type, child["internalValue"]) && responseCode;
                 break;
             }
+            case webifc::parsing::IfcTokenType::BINARY:
             case webifc::parsing::IfcTokenType::STRING:
             case webifc::parsing::IfcTokenType::ENUM:
             case webifc::parsing::IfcTokenType::REF:
             case webifc::parsing::IfcTokenType::INTEGER:
             {
-                WriteValue(modelID, type, child["value"]);
+                responseCode = WriteValue(modelID, type, child["value"]) && responseCode;
                 break;
             }
             default:
@@ -577,7 +811,7 @@ bool WriteSet(uint32_t modelID, emscripten::val &val)
             else
                 type = webifc::parsing::IfcTokenType::ENUM;
             loader->Push<uint8_t>(type);
-            WriteValue(modelID, type, child);
+            responseCode = WriteValue(modelID, type, child) && responseCode;
         }
         else
         {
@@ -609,6 +843,21 @@ bool WriteHeaderLine(uint32_t modelID, uint32_t type, emscripten::val parameters
 {
     if (!manager.IsModelOpen(modelID))
         return false;
+    if (!ValidateBinaryArguments(parameters))
+    {
+        spdlog::error("Invalid STEP binary value: expected a hex string with valid padding, at most 65535 characters");
+        return false;
+    }
+    if (!ValidateIntegerArguments(parameters))
+    {
+        spdlog::error("Integer write rejected: expected a number within the JavaScript safe integer range");
+        return false;
+    }
+    if (!ValidateStringArguments(parameters))
+    {
+        spdlog::error("STRING exceeds the encoded tape limit or is not a string");
+        return false;
+    }
     auto loader = manager.GetIfcLoader(modelID);
     uint32_t start = loader->GetTotalSize();
     std::string ifcName = manager.GetSchemaManager().IfcTypeCodeToType(type);
@@ -618,7 +867,7 @@ bool WriteHeaderLine(uint32_t modelID, uint32_t type, emscripten::val parameters
     loader->Push((void *)ifcName.data(), ifcName.size());
     bool responseCode = WriteSet(modelID, parameters);
     loader->Push<uint8_t>(webifc::parsing::IfcTokenType::LINE_END);
-    loader->AddHeaderLineTape(type, start);
+    if (responseCode) loader->AddHeaderLineTape(type, start);
     return responseCode;
 }
 
@@ -632,6 +881,21 @@ bool WriteLine(uint32_t modelID, uint32_t expressID, uint32_t type, emscripten::
 {
     if (!manager.IsModelOpen(modelID))
         return false;
+    if (!ValidateBinaryArguments(parameters))
+    {
+        spdlog::error("Invalid STEP binary value: expected a hex string with valid padding, at most 65535 characters");
+        return false;
+    }
+    if (!ValidateIntegerArguments(parameters))
+    {
+        spdlog::error("Integer write rejected: expected a number within the JavaScript safe integer range");
+        return false;
+    }
+    if (!ValidateStringArguments(parameters))
+    {
+        spdlog::error("STRING exceeds the encoded tape limit or is not a string");
+        return false;
+    }
     auto loader = manager.GetIfcLoader(modelID);
     uint32_t start = loader->GetTotalSize();
 
@@ -649,7 +913,7 @@ bool WriteLine(uint32_t modelID, uint32_t expressID, uint32_t type, emscripten::
     // end line
     loader->Push<uint8_t>(webifc::parsing::IfcTokenType::LINE_END);
 
-    loader->UpdateLineTape(expressID, type, start);
+    if (responseCode) loader->UpdateLineTape(expressID, type, start);
     return responseCode;
 }
 
@@ -658,6 +922,8 @@ emscripten::val ReadValue(uint32_t modelID, webifc::parsing::IfcTokenType t)
     auto loader = manager.GetIfcLoader(modelID);
     switch (t)
     {
+    case webifc::parsing::IfcTokenType::BINARY:
+        return emscripten::val(std::string(loader->GetStringArgument()));
     case webifc::parsing::IfcTokenType::STRING:
     {
         return emscripten::val(loader->GetDecodedStringArgument());
@@ -686,8 +952,8 @@ emscripten::val ReadValue(uint32_t modelID, webifc::parsing::IfcTokenType t)
     }
     case webifc::parsing::IfcTokenType::INTEGER:
     {
-        long d = loader->GetIntArgument();
-        return emscripten::val(d);
+        const int64_t d = loader->GetIntArgument();
+        return emscripten::val(static_cast<double>(d));
     }
     case webifc::parsing::IfcTokenType::REF:
     {
@@ -747,6 +1013,7 @@ emscripten::val GetArgs(uint32_t modelID, bool inObject = false, bool inList = f
             arguments.set(size++, obj);
             break;
         }
+        case webifc::parsing::IfcTokenType::BINARY:
         case webifc::parsing::IfcTokenType::STRING:
         case webifc::parsing::IfcTokenType::ENUM:
         case webifc::parsing::IfcTokenType::REAL:
@@ -995,6 +1262,7 @@ EMSCRIPTEN_BINDINGS(my_module)
 
     emscripten::value_object<webifc::geometry::IfcPlacedGeometry>("IfcPlacedGeometry")
         .field("color", &webifc::geometry::IfcPlacedGeometry::color)
+        .field("hasColor", &webifc::geometry::IfcPlacedGeometry::hasColor)
         .field("flatTransformation", &webifc::geometry::IfcPlacedGeometry::flatTransformation)
         .field("geometryExpressID", &webifc::geometry::IfcPlacedGeometry::geometryExpressID);
 
@@ -1156,11 +1424,17 @@ EMSCRIPTEN_BINDINGS(my_module)
     emscripten::function("GetModelSize", &GetModelSize);
     emscripten::function("IsModelOpen", &IsModelOpen);
     emscripten::function("GetGeometry", &GetGeometry);
+    emscripten::function("ResetCache", &ResetCache);
     emscripten::function("GetFlatMesh", &GetFlatMesh);
     emscripten::function("GetCoordinationMatrix", &GetCoordinationMatrix);
     emscripten::function("GetWorldTransformMatrix", &GetWorldTransformMatrix);
     emscripten::function("StreamMeshes", &StreamMeshesWithExpressID);
     emscripten::function("StreamAllMeshes", &StreamAllMeshes);
+#ifdef BREP_ENGINE
+    emscripten::function("StreamBrepMeshes", &StreamBrepMeshesWithExpressID);
+    emscripten::function("StreamAllBrepMeshes", &StreamAllBrepMeshes);
+    emscripten::function("SetBrepBooleansOnly", &SetBrepBooleansOnly);
+#endif
     emscripten::function("StreamAllMeshesWithTypes", &StreamAllMeshesWithTypesVal);
     emscripten::function("GetLine", &GetLine);
     emscripten::function("GetLines", &GetLines);

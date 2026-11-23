@@ -4,6 +4,8 @@
  
 
 #include "IfcTokenStream.h"
+#include "StepBinary.h"
+#include <spdlog/spdlog.h>
 
 namespace webifc::parsing
 {
@@ -63,6 +65,7 @@ namespace webifc::parsing
           // turns out this is just part of ISO 10303-21, thanks ottosson!
           while (true)
           {
+            if (_fileStream->IsAtEnd()) { _parseFailed = true; spdlog::error("Unterminated STEP string"); return; }
   
             temp.push_back(_fileStream->Get());
             // if its a quote, maybe its the end of the string
@@ -99,6 +102,32 @@ namespace webifc::parsing
           Push<uint16_t>(temp.size());
           if (temp.size() > 0) Push(temp.data(),temp.size());
         } 
+        else if (c == '"')
+        {
+          temp.clear();
+          _fileStream->Forward();
+          while (!_fileStream->IsAtEnd() && _fileStream->Get() != '"')
+          {
+            const char digit = _fileStream->Get();
+            if (BinaryHexDigit(digit) < 0 || temp.size() == MAX_BINARY_LENGTH)
+            {
+              spdlog::error("Invalid STEP binary digit or value exceeds 65535 characters");
+              _parseFailed = true;
+              return;
+            }
+            temp.push_back(CanonicalBinaryDigit(digit));
+            _fileStream->Forward();
+          }
+          if (_fileStream->IsAtEnd() || !IsValidStepBinary(std::string_view(temp.data(), temp.size())))
+          {
+            spdlog::error("Invalid or unterminated STEP binary value");
+            _parseFailed = true;
+            return;
+          }
+          Push<uint8_t>(IfcTokenType::BINARY);
+          Push<uint16_t>(temp.size());
+          Push(temp.data(), temp.size());
+        }
         else if (c == '#')
         {
           _fileStream->Forward();
@@ -123,7 +152,8 @@ namespace webifc::parsing
             _fileStream->Forward();
 
             // comment
-            while (!(_fileStream->Prev() == '*' && _fileStream->Get() == '/')) _fileStream->Forward();
+            while (!_fileStream->IsAtEnd() && !(_fileStream->Prev() == '*' && _fileStream->Get() == '/')) _fileStream->Forward();
+            if (_fileStream->IsAtEnd()) { _parseFailed = true; spdlog::error("Unterminated STEP comment"); return; }
   
           }
           else Push<uint8_t>(IfcTokenType::UNKNOWN);
@@ -157,6 +187,7 @@ namespace webifc::parsing
           char c = _fileStream->Get();
           while ( c != '.')
           {
+            if (_fileStream->IsAtEnd()) { _parseFailed = true; spdlog::error("Unterminated STEP enumeration"); return; }
             temp.push_back(c);
             _fileStream->Forward();
             c = _fileStream->Get();

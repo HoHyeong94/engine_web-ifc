@@ -46,39 +46,39 @@ namespace webifc::parsing {
      return ret;
    }
    
-   void IfcLoader::LoadFile(const std::function<uint32_t(char *, size_t, size_t)> &requestData)
+   bool IfcLoader::LoadFile(const std::function<uint32_t(char *, size_t, size_t)> &requestData)
    { 
-     _tokenStream->SetTokenSource(requestData);
+     if (!_tokenStream->SetTokenSource(requestData)) return false;
      ParseLines();
+     return true;
    }
 
-   IFC_SCHEMA IfcLoader::GetSchema() const
-   { 
-      auto line = GetHeaderLinesWithType(schema::FILE_SCHEMA)[0];
-      MoveToHeaderLineArgument(line, 0);
-      auto schemas = _schemaManager.GetAvailableSchemas();
-      auto schemaMaps = _schemaManager.GetAvailableSchemaMaps();
-
-      while (!_tokenStream->IsAtEnd()) {
-          IfcTokenType t = static_cast<IfcTokenType>(_tokenStream->Read<char>());
-          if (t == IfcTokenType::LINE_END) break;
-          if (t == IfcTokenType::LABEL) 
-          {
-            std::string_view schemaName = _tokenStream->ReadString();
-            if (schemaMaps.contains(schemaName)) schemaName = schemaMaps[schemaName];
-            for (size_t i = 0; i < schemas.size();i++) 
-            {
-              if (_schemaManager.GetSchemaName(schemas[i]) == schemaName) return schemas[i];
-            }
-          }
+IFC_SCHEMA IfcLoader::GetSchema() const
+{ 
+   auto lines = GetHeaderLinesWithType(schema::FILE_SCHEMA);
+   if (lines.empty()) return IFC2X3;
+   MoveToHeaderLineArgument(lines[0], 0);
+   const auto& maps = _schemaManager.GetAvailableSchemaMaps();
+   for (uint32_t offset : GetSetArgument())
+   {
+      IfcTokenType t = GetTokenType(offset);
+      if (t != IfcTokenType::STRING && t != IfcTokenType::LABEL) continue;
+      StepBack();
+      std::string_view name = GetStringArgument();
+      if (maps.contains(name)) name = maps.at(name);
+      for (IFC_SCHEMA s : _schemaManager.GetAvailableSchemas())
+      {
+         if (_schemaManager.GetSchemaName(s) == name) return s;
       }
-      return IFC2X3;
    }
+   return IFC2X3;
+}
    
-   void IfcLoader::LoadFile(std::istream &requestData)
+   bool IfcLoader::LoadFile(std::istream &requestData)
    { 
-     _tokenStream->SetTokenSource(requestData);
+     if (!_tokenStream->SetTokenSource(requestData)) return false;
      ParseLines();
+     return true;
    }
    
    void IfcLoader::SaveFile(const std::function<void(char *, size_t)> &outputData, bool orderLinesByExpressID) const
@@ -192,10 +192,19 @@ namespace webifc::parsing {
             output << ")";
             break;
           }
+          case IfcTokenType::BINARY:
+          {
+            output << '\"' << _tokenStream->ReadString() << '\"';
+            break;
+          }
           case IfcTokenType::STRING:
           {
+            // The tape holds the STEP-ENCODED text (the tokenizer keeps the
+            // source escapes; writers encode before pushing), so it is written
+            // verbatim — upstream 0.79 (cabac180). Re-encoding here doubled
+            // every '' and \ of the source.
             output << "'";
-            p21encode(_tokenStream->ReadString(),output);
+            output << _tokenStream->ReadString();
             output << "'";
             break;
           }
@@ -250,6 +259,7 @@ namespace webifc::parsing {
   
    void IfcLoader::ParseLines() 
    {
+      ++_revision;
   			_lines.reserve(_tokenStream->GetNoLines());
         uint32_t currentIfcType = 0;
   			uint32_t currentExpressID = 0;
@@ -287,6 +297,7 @@ namespace webifc::parsing {
   				case IfcTokenType::SET_BEGIN:
   				case IfcTokenType::SET_END:
   					break;
+				case IfcTokenType::BINARY:
   				case IfcTokenType::STRING:
           case IfcTokenType::REAL:
           case IfcTokenType::INTEGER:
@@ -385,7 +396,7 @@ namespace webifc::parsing {
       Push((void*)numberString.c_str(), numberString.size());        
    }
 
-   void IfcLoader::PushInt(int input)
+   void IfcLoader::PushInt(int64_t input)
    {
     std::string numberString = std::to_string(input);
     uint16_t length = numberString.size();
@@ -406,13 +417,13 @@ namespace webifc::parsing {
       return GetStringArgument();
    }
 
-   long IfcLoader::GetIntArgument() const
+   int64_t IfcLoader::GetIntArgument() const
    {
        std::string_view str = GetStringArgument();
        return std::stoll(std::string(str));
    }
 
-  long IfcLoader::GetIntArgument(const uint32_t tapeOffset) const
+  int64_t IfcLoader::GetIntArgument(const uint32_t tapeOffset) const
   {
     _tokenStream->MoveTo(tapeOffset);
     return GetIntArgument();
@@ -454,11 +465,16 @@ namespace webifc::parsing {
 
   void IfcLoader::RemoveLine(const uint32_t expressID)
   {
-      _lines.erase(expressID);
+      ++_revision;
+      const auto lineIt = _lines.find(expressID);
+      if (lineIt == _lines.end()) return;
+      std::erase(_ifcTypeToExpressID[lineIt->second.ifcType], expressID);
+      _lines.erase(lineIt);
   }
   
   void IfcLoader::UpdateLineTape(const uint32_t expressID, const uint32_t type, const uint32_t start)
   {
+      ++_revision;
       const auto lineIt = _lines.find(expressID);
       if (lineIt == _lines.end()) {
         // create line object
@@ -478,6 +494,7 @@ namespace webifc::parsing {
 
   void IfcLoader::AddHeaderLineTape(const uint32_t type, const uint32_t start)
   {
+      ++_revision;
     
       IfcLine l = IfcLine();
       l.ifcType = type;
@@ -529,10 +546,24 @@ namespace webifc::parsing {
      std::vector<uint32_t> tapeOffsets;
      tapeOffsets.reserve(4);
 
-     _tokenStream->Read<char>(); // set begin
+     // The cursor must be on the SET_BEGIN of the list. Anything else (a reference,
+     // an empty list, a line end left behind by a missing line) is not a list.
+     if (GetTokenType() != IfcTokenType::SET_BEGIN)
+     {
+         StepBack();
+         spdlog::error("[GetSetArgument()] expected set begin {}", GetCurrentLineExpressID());
+         return tapeOffsets;
+     }
      int depth = 1;
      while (depth > 0)
      {
+         // A list never spans lines and the tape ends with the last line:
+         // stop at either, so a malformed list cannot walk past the end of the tape.
+         if (_tokenStream->IsAtEnd())
+         {
+             spdlog::error("[GetSetArgument()] unexpected end of file {}", GetCurrentLineExpressID());
+             break;
+         }
          uint32_t offset = _tokenStream->GetReadOffset();
          IfcTokenType t = static_cast<IfcTokenType>(_tokenStream->Read<char>());
 
@@ -543,10 +574,15 @@ namespace webifc::parsing {
          case IfcTokenType::SET_END:
              depth--;
              break;
+         case IfcTokenType::LINE_END:
+             StepBack();
+             spdlog::error("[GetSetArgument()] unterminated list {}", GetCurrentLineExpressID());
+             return tapeOffsets;
          case IfcTokenType::REF:
              tapeOffsets.push_back(offset);
              _tokenStream->Read<uint32_t>();
              break;
+         case IfcTokenType::BINARY:
          case IfcTokenType::STRING:
          case IfcTokenType::INTEGER:
          case IfcTokenType::REAL:
@@ -569,16 +605,34 @@ namespace webifc::parsing {
    const std::vector<std::vector<uint32_t>> IfcLoader::GetSetListArgument() const
    { 
      std::vector<std::vector<uint32_t>> tapeOffsets;
-   	 _tokenStream->Read<char>(); // set begin
+   	 // The cursor must be on the SET_BEGIN of the list (see GetSetArgument)
+   	 if (GetTokenType() != IfcTokenType::SET_BEGIN)
+   	 {
+   	 	StepBack();
+   	 	spdlog::error("[GetSetListArgument()] expected set begin {}", GetCurrentLineExpressID());
+   	 	return tapeOffsets;
+   	 }
    	 int depth = 1;
    	 std::vector<uint32_t> tempSet;
 
      	while (true)
      	{
+     		// Bounded by the end of the tape and by the end of the line (see GetSetArgument)
+     		if (_tokenStream->IsAtEnd())
+     		{
+     			spdlog::error("[GetSetListArgument()] unexpected end of file {}", GetCurrentLineExpressID());
+     			break;
+     		}
      		uint32_t offset = _tokenStream->GetReadOffset();
      		IfcTokenType t = static_cast<IfcTokenType>(_tokenStream->Read<char>());
 
-     		if (t == IfcTokenType::SET_BEGIN)
+     		if (t == IfcTokenType::LINE_END)
+     		{
+     			StepBack();
+     			spdlog::error("[GetSetListArgument()] unterminated list {}", GetCurrentLineExpressID());
+     			break;
+     		}
+     		else if (t == IfcTokenType::SET_BEGIN)
      		{
      			tempSet = std::vector<uint32_t>();
      			depth++;
@@ -600,7 +654,7 @@ namespace webifc::parsing {
      			{
      				_tokenStream->Read<uint32_t>();
      			}
-     			else if (t == IfcTokenType::STRING || t == IfcTokenType::INTEGER || t == IfcTokenType::REAL || t == IfcTokenType::LABEL || t == IfcTokenType::ENUM)
+			else if (t == IfcTokenType::BINARY || t == IfcTokenType::STRING || t == IfcTokenType::INTEGER || t == IfcTokenType::REAL || t == IfcTokenType::LABEL || t == IfcTokenType::ENUM)
      			{
      				uint16_t length = _tokenStream->Read<uint16_t>();
      				_tokenStream->Forward(length);
@@ -636,14 +690,23 @@ namespace webifc::parsing {
    			}
    		}
 
+   		// The argument does not exist: stop at the end of the tape (see GetSetArgument)
+   		if (_tokenStream->IsAtEnd())
+   		{
+   			spdlog::error("[ArgumentOffset()] unexpected end of file {}", GetCurrentLineExpressID());
+   			return;
+   		}
+
    		IfcTokenType t = static_cast<IfcTokenType>(_tokenStream->Read<char>());
 
    		switch (t)
    		{
    		case IfcTokenType::LINE_END:
    		{
+   			// Fewer arguments than requested: do not continue into the next line
+   			StepBack();
    			spdlog::error("[ArgumentOffset()] unexpected line end {}", GetCurrentLineExpressID());
-   			break;
+   			return;
    		}
    		case IfcTokenType::UNKNOWN:
    		case IfcTokenType::EMPTY:
@@ -658,6 +721,7 @@ namespace webifc::parsing {
    				return;
    			}
    			break;
+		case IfcTokenType::BINARY:
    		case IfcTokenType::STRING:
    		case IfcTokenType::ENUM:
    		case IfcTokenType::LABEL:
@@ -693,6 +757,7 @@ namespace webifc::parsing {
       uint32_t noArguments = 0;
 
        while (true) {
+        if (_tokenStream->IsAtEnd()) return noArguments;
         IfcTokenType t = static_cast<IfcTokenType>(_tokenStream->Read<char>());
         if (t == SET_END || t==LINE_END) return noArguments;
         if (t == UNKNOWN || t==EMPTY) {
@@ -706,7 +771,7 @@ namespace webifc::parsing {
 		      continue;
 
         }
-        if (t == IfcTokenType::STRING || t == IfcTokenType::INTEGER || t == IfcTokenType::REAL || t == IfcTokenType::LABEL || t == IfcTokenType::ENUM) {
+        if (t == IfcTokenType::BINARY || t == IfcTokenType::STRING || t == IfcTokenType::INTEGER || t == IfcTokenType::REAL || t == IfcTokenType::LABEL || t == IfcTokenType::ENUM) {
           uint16_t length = _tokenStream->Read<uint16_t>();
           _tokenStream->Forward(length);
           noArguments++;

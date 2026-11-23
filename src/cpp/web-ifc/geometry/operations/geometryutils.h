@@ -14,6 +14,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <spdlog/spdlog.h>
 #include <glm/gtc/matrix_transform.hpp>
 #include "../representation/geometry.h"
@@ -77,11 +78,17 @@ namespace webifc::geometry
 
 	inline IfcGeometry Sweep(const double scaling, const bool closed, const IfcProfile &profile, const IfcCurve &directrix, const glm::dvec3 &initialDirectrixNormal = glm::dvec3(0), const bool rotate90 = false, const bool optimize = true)
 	{
-		IfcGeometry geom = ToIfcGeometry(bimGeometry::SweepFunction(scaling, closed, profile.curve.points, directrix.points, initialDirectrixNormal, rotate90, optimize));
+		std::vector<std::vector<glm::dvec3>> rings;
+		rings.push_back(profile.curve.points);
+		for (auto &hole : profile.holes)
+		{
+			rings.push_back(hole.points);
+		}
+		IfcGeometry geom = ToIfcGeometry(bimGeometry::SweepFunction(scaling, closed, rings, directrix.points, initialDirectrixNormal, rotate90, optimize));
 		return geom;
 	}
 
-	inline IfcGeometry SweepCircular(const double scaling, const bool closed, const IfcProfile &profile, const double radius, const IfcCurve &directrix, const glm::dvec3 &initialDirectrixNormal = glm::dvec3(0), const bool rotate90 = false)
+	inline IfcGeometry SweepCircular(const double scaling, const bool closed, const IfcProfile &profile, const double radius, const IfcCurve &directrix, const glm::dvec3 &initialDirectrixNormal = glm::dvec3(0), const bool rotate90 = false, const double innerRadius = 0)
 	{
 		spdlog::debug("[SweepCircular({})]");
 
@@ -92,7 +99,7 @@ namespace webifc::geometry
 		{
 			if (i < directrix.points.size() - 1)
 			{
-				if (glm::distance(directrix.points[i], directrix.points[i + 1]) > EPS_BIG2 * scaling)
+				if (glm::distance(directrix.points[i], directrix.points[i + 1]) > EPS_BIG2 / scaling)
 				{
 					directrix_vector.push_back(directrix.points[i]);
 				}
@@ -109,7 +116,7 @@ namespace webifc::geometry
 			profile_vector.push_back(pt2D);
 		}
 
-		return ToIfcGeometry(bimGeometry::SweepCircular(scaling, closed, profile_vector, radius, directrix_vector, initialDirectrixNormal, rotate90));
+		return ToIfcGeometry(bimGeometry::SweepCircular(scaling, closed, profile_vector, radius, directrix_vector, initialDirectrixNormal, rotate90, innerRadius));
 	}
 
 	inline bool computeSafeNormal(const glm::dvec3 v1, const glm::dvec3 v2, const glm::dvec3 v3, glm::dvec3 &normal, double eps = 0)
@@ -188,6 +195,12 @@ namespace webifc::geometry
 		// multiple tries to find the best match
 		return computeSafeNormal(v1, v2, v3, normal, 1e-08);
 	}
+
+	// Out-of-plane spread (relative to the face extent) above plain floating point noise.
+	constexpr double FACE_NOISE_MIN_RELATIVE = 1.0E-10;
+	// Largest spread still treated as noise: the boolean kernel's plane tolerance. A face warped
+	// beyond it cannot become a single boolean plane, so it keeps its triangle normals.
+	constexpr double FACE_NOISE_MAX = 1.0E-04;
 
 	inline void TriangulateBounds(IfcGeometry& geometry, std::vector<IfcBound3D>& bounds, uint32_t expressID)
 	{
@@ -279,8 +292,24 @@ namespace webifc::geometry
 				bool inside = false;
 				size_t n = poly.size();
 				for (size_t i = 0, j = n - 1; i < n; j = i++) {
+					// Projection can put a touching inner-bound vertex a few ulps to either
+					// side of the outer edge. Boundary points belong to the containing loop;
+					// rejecting them drops the entire face and leaves the BRep cutter open.
+					const glm::dvec2 edge = poly[j] - poly[i];
+					const glm::dvec2 delta = p - poly[i];
+					const double length = glm::length(edge);
+					const double tolerance = 32 * std::numeric_limits<double>::epsilon() *
+						std::max({1.0, std::abs(poly[i].x), std::abs(poly[i].y),
+							std::abs(poly[j].x), std::abs(poly[j].y), std::abs(p.x), std::abs(p.y)});
+					const double along = glm::dot(delta, edge);
+					if ((length == 0 && glm::length(delta) <= tolerance) ||
+						(length > 0 && along >= -tolerance * length &&
+							along <= length * length + tolerance * length &&
+							std::abs(edge.x * delta.y - edge.y * delta.x) <= tolerance * length)) {
+						return true;
+					}
 					if ((poly[i].y > p.y) != (poly[j].y > p.y) &&
-						(p.x < poly[i].x + (poly[j].x - poly[i].x) * (p.y - poly[i].y) / (poly[j].y - poly[i].y + 1e-10))) {
+						(p.x < poly[i].x + (poly[j].x - poly[i].x) * (p.y - poly[i].y) / (poly[j].y - poly[i].y))) {
 						inside = !inside;
 					}
 				}
@@ -362,6 +391,47 @@ namespace webifc::geometry
 				}
 			}
 
+			// Give every vertex of the face the face's best-fit (Newell) normal. The three-point basis
+			// normal above is sensitive to rounding noise in the coordinates; buildPlanes reuses this
+			// shared normal so all triangles of one face land on a single boolean plane.
+			glm::dvec3 faceNormal(0);
+			const auto& outerPoints = bounds[0].curve.points;
+			for (size_t i = 0; i < outerPoints.size(); i++)
+			{
+				const glm::dvec3& a = outerPoints[i];
+				const glm::dvec3& b = outerPoints[(i + 1) % outerPoints.size()];
+				faceNormal += glm::dvec3((a.y - b.y) * (a.z + b.z), (a.z - b.z) * (a.x + b.x), (a.x - b.x) * (a.y + b.y));
+			}
+			if (glm::length(faceNormal) > 0)
+			{
+				faceNormal = glm::normalize(faceNormal);
+				if (glm::dot(faceNormal, n) < 0) faceNormal = -faceNormal;
+
+				// Only faces with measurable out-of-plane noise need the shared normal; exactly
+				// planar faces keep the basis normal so their boolean results stay unchanged.
+				glm::dvec3 boxMin(std::numeric_limits<double>::max());
+				glm::dvec3 boxMax(std::numeric_limits<double>::lowest());
+				double minOffset = std::numeric_limits<double>::max();
+				double maxOffset = std::numeric_limits<double>::lowest();
+				for (const auto& bound : bounds)
+				{
+					for (const glm::dvec3& pt : bound.curve.points)
+					{
+						boxMin = glm::min(boxMin, pt);
+						boxMax = glm::max(boxMax, pt);
+						const double offset = glm::dot(pt, faceNormal);
+						minOffset = std::min(minOffset, offset);
+						maxOffset = std::max(maxOffset, offset);
+					}
+				}
+				const double extent = glm::distance(boxMin, boxMax);
+				const double spread = maxOffset - minOffset;
+				if (glm::dot(faceNormal, n) > 0.99 && spread > FACE_NOISE_MIN_RELATIVE * extent && spread <= FACE_NOISE_MAX)
+				{
+					n = faceNormal;
+				}
+			}
+
 			// Now add points to geometry
 			for (size_t i = 0; i < bounds.size(); i++)
 			{
@@ -430,178 +500,17 @@ namespace webifc::geometry
 
 	using Point = std::array<double, 3>;
 
-	inline IfcGeometry SectionedSurface(IfcCrossSections profiles_, bool buildCaps)
-	{
-		spdlog::debug("[SectionedSurface({})]");
-
-		std::vector<std::vector<glm::dvec3>> profiles;
-
-		for (size_t i = 0; i < profiles_.curves.size(); i++)
-		{
-			std::vector<glm::dvec3> profile;
-			for (size_t j = 0; j < profiles_.curves[i].points.size(); j++)
-			{
-				profile.push_back({profiles_.curves[i].points[j].x, profiles_.curves[i].points[j].y, profiles_.curves[i].points[j].z});
-			}
-			
-			profiles.push_back(profile);
-		}
-
-		IfcGeometry geom = ToIfcGeometry(bimGeometry::SectionedSurface(profiles,buildCaps,EPS_SMALL));
-
-		if (buildCaps && profiles.size() > 1)
-		{
-			bimGeometry::Geometry geom;
-			std::vector<bool> holesIndicesHash;
-
-			// check if first point is equal to last point, otherwise the outer loop of the shape is not closed
-			glm::dvec3 lastToFirstPoint = profiles[0].front() - profiles[0].back();
-			if (glm::length(lastToFirstPoint) > 1e-8)
-			{
-				profiles[0].push_back(profiles[0].front());
-			}
-			
-			glm::dvec3 pointInSection0 = profiles[0][0];
-			glm::dvec3 pointInSection1 = profiles[1][0];
-			glm::dvec3 normal = pointInSection1 - pointInSection0;
-			double distance = normal.length();
-			normal = glm::normalize(normal);
-			glm::dvec3 dir = normal;
-			glm::dvec3 cuttingPlaneNormal = glm::dvec3(0);
-			glm::dvec3 cuttingPlanePos = glm::dvec3(0);
-
-			// build the caps
-			{
-				int polygonCount = profiles.size(); // Main profile + holes
-				std::vector<std::vector<Point>> polygon(polygonCount);
-							
-
-				for (size_t i = 0; i < profiles[0].size(); i++)
-				{
-					glm::dvec3 pt = profiles[0][i];
-					glm::dvec4 et = glm::dvec4(glm::dvec3(pt) + dir * distance, 1);
-
-					geom.AddPoint(et, normal);
-					polygon[0].push_back(Point{ pt.x, pt.y, pt.z });
-				}
-
-				for (size_t i = 0; i < profiles[0].size(); i++)
-				{
-					holesIndicesHash.push_back(false);
-				}
-
-				for (size_t i = 1; i < profiles.size(); i++)
-				{
-					std::vector<glm::dvec3> hole = profiles[i];
-					int pointCount = hole.size();
-
-					for (int j = 0; j < pointCount; j++)
-					{
-						holesIndicesHash.push_back(j == 0);
-
-						glm::dvec3 pt = hole[j];
-						glm::dvec4 et = glm::dvec4(pt + dir * distance, 1);
-
-						profiles[0].push_back(pt);
-						geom.AddPoint(et, normal);
-						polygon[i].push_back({ pt.x, pt.y, pt.z }); // Index 0 is main profile; see earcut reference
-					}
-				}
-
-				bimGeometry::Projection proj = bimGeometry::bestProjection(polygon[0]);
-				auto polygon2D = projectTo2D(polygon, proj);
-				std::vector<uint32_t> indices = mapbox::earcut<uint32_t>(polygon2D);
-
-				uint32_t offset = 0;
-				bool winding = true;
-				bool flipWinding = false;
-
-				if (indices.size() >= 3)
-				{
-					bool winding = bimGeometry::GetWindingOfTriangle(geom.GetPoint(offset + indices[0]), geom.GetPoint(offset + indices[1]), geom.GetPoint(offset + indices[2]));
-					bool flipWinding = !winding;
-
-					for (size_t i = 0; i < indices.size(); i += 3)
-					{
-						if (flipWinding)
-						{
-							geom.AddFace(offset + indices[i + 0], offset + indices[i + 2], offset + indices[i + 1], -1);
-						}
-						else
-						{
-							geom.AddFace(offset + indices[i + 0], offset + indices[i + 1], offset + indices[i + 2], -1);
-						}
-					}
-				}
-
-				offset += geom.numPoints;
-
-				normal = -dir;
-
-				for (size_t i = 0; i < profiles[0].size(); i++)
-				{
-					glm::dvec3 pt = profiles[0][i];
-					glm::dvec4 et = glm::dvec4(glm::dvec3(pt), 1);
-
-					if (cuttingPlaneNormal != glm::dvec3(0))
-					{
-						et = glm::dvec4(glm::dvec3(pt), 1);
-						glm::dvec3 transDir = glm::dvec4(dir, 0);
-
-						// project {et} onto the plane, following the extrusion normal
-						double ldotn = glm::dot(transDir, cuttingPlaneNormal);
-						if (ldotn == 0)
-						{
-						}
-						else
-						{
-							glm::dvec3 dpos = cuttingPlanePos - glm::dvec3(et);
-							double dist = glm::dot(dpos, cuttingPlaneNormal) / ldotn;
-							// we want to apply dist, even when negative
-							et = et + glm::dvec4(dist * transDir, 1);
-						}
-					}
-
-					geom.AddPoint(et, normal);
-				}
-
-				for (size_t i = 0; i < indices.size(); i += 3)
-				{
-					if (flipWinding)
-					{
-						geom.AddFace(offset + indices[i + 0], offset + indices[i + 1], offset + indices[i + 2], -1);
-					}
-					else
-					{
-						geom.AddFace(offset + indices[i + 0], offset + indices[i + 2], offset + indices[i + 1], -1);
-					}
-				}
-			}
-
-			uint32_t capSize = profiles[0].size();
-			for (size_t i = 1; i < capSize; i++)
-			{
-				// https://github.com/tomvandig/web-ifc/issues/5
-				if (holesIndicesHash[i])
-				{
-					continue;
-				}
-
-				uint32_t bl = i - 1;
-				uint32_t br = i - 0;
-
-				uint32_t tl = capSize + i - 1;
-				uint32_t tr = capSize + i - 0;
-
-				// this winding should be correct
-				geom.AddFace(geom.GetPoint(tl), geom.GetPoint(br), geom.GetPoint(bl));
-				geom.AddFace(geom.GetPoint(tl), geom.GetPoint(tr), geom.GetPoint(br));
-			}
-
-		}
-
-		return geom;
-	}
+    inline IfcGeometry SectionedSurface(const IfcCrossSections& profiles, bool buildCaps)
+    {
+        std::vector<std::vector<std::vector<glm::dvec3>>> sections;
+        for (size_t i = 0; i < profiles.curves.size(); ++i)
+        {
+            sections.push_back({profiles.curves[i].points});
+            if (i < profiles.holes.size())
+                for (const auto& hole : profiles.holes[i]) sections.back().push_back(hole.points);
+        }
+        return ToIfcGeometry(bimGeometry::SectionedSurfaceRings(std::move(sections), buildCaps, EPS_SMALL));
+    }
 
 	inline IfcGeometry Extrude(IfcProfile profile, glm::dvec3 dir, double distance, glm::dvec3 cuttingPlaneNormal = glm::dvec3(0), glm::dvec3 cuttingPlanePos = glm::dvec3(0))
 	{
@@ -638,98 +547,252 @@ namespace webifc::geometry
 		return ToIfcGeometry(bimGeometry::Extrude(profile_vector, dir, distance, cuttingPlaneNormal, cuttingPlanePos));
 	}
 
-	inline IfcGeometry SweepFixedReference(double linearScalingFactor, bool closed, const IfcProfile& profile, const IfcCurve& directrix, const glm::dvec3& fixedReference)
+	inline IfcGeometry RevolveProfile(const IfcProfile& profile, glm::dvec3 axis, const glm::dvec3& origin, double angle, uint16_t circleSegments)
+	{
+		IfcGeometry geometry;
+		if (profile.isComposite)
+		{
+			for (const auto& child : profile.profiles)
+				geometry.AddGeometry(RevolveProfile(child, axis, origin, angle, circleSegments));
+			return geometry;
+		}
+		if (glm::length(axis) == 0 || !std::isfinite(angle) || angle == 0 || profile.curve.points.size() < 3) return geometry;
+        // Some exporters use signed plane-angle measures. Preserve their direction
+        // instead of silently dropping the solid; standard positive angles are unchanged.
+        if (angle < 0) { axis = -axis; angle = -angle; }
+        if (angle > 2 * glm::pi<double>() + 1e-8) return geometry;
+		axis = glm::normalize(axis);
+		std::vector<std::vector<glm::dvec2>> rings;
+		for (size_t r = 0; r <= profile.holes.size(); ++r)
+		{
+			auto points = r == 0 ? profile.curve.points : profile.holes[r - 1].points;
+			if (points.size() > 1 && glm::length(points.front() - points.back()) < 1e-8) points.pop_back();
+			if (points.size() < 3) return IfcGeometry();
+			double area = 0;
+			for (size_t i = 0; i < points.size(); ++i)
+				area += points[i].x * points[(i + 1) % points.size()].y - points[(i + 1) % points.size()].x * points[i].y;
+			if ((area > 0) != (r == 0)) std::reverse(points.begin(), points.end());
+			rings.emplace_back();
+			for (const auto& point : points) rings.back().emplace_back(point.x, point.y);
+		}
+		const double fullAngle = 2 * glm::pi<double>();
+		const bool closed = std::abs(angle - fullAngle) < 1e-8;
+		const size_t segments = std::max<size_t>(3, std::ceil(std::max<uint16_t>(circleSegments, 12) * angle / fullAngle));
+		glm::dvec3 centre(0);
+		for (const auto& point : rings[0]) centre += glm::dvec3(point, 0);
+		centre /= static_cast<double>(rings[0].size());
+		const bool reverse = glm::cross(axis, centre - origin).z < 0;
+		auto pointAt = [&](const glm::dvec2& point, size_t step)
+		{
+			const double theta = closed && step == segments ? 0 : angle * step / segments;
+			return origin + glm::dvec3(glm::rotate(glm::dmat4(1), theta, axis) * glm::dvec4(glm::dvec3(point, 0) - origin, 0));
+		};
+		auto face = [&](glm::dvec3 a, glm::dvec3 b, glm::dvec3 c)
+		{
+			if (reverse) std::swap(b, c);
+			if (glm::length(glm::cross(b - a, c - a)) > 1e-14) geometry.AddFace(a, b, c);
+		};
+		for (const auto& ring : rings)
+			for (size_t step = 0; step < segments; ++step)
+				for (size_t i = 0; i < ring.size(); ++i)
+				{
+					const size_t j = (i + 1) % ring.size();
+					const auto a = pointAt(ring[i], step), b = pointAt(ring[j], step);
+					const auto c = pointAt(ring[j], step + 1), d = pointAt(ring[i], step + 1);
+					face(a, b, c); face(a, c, d);
+				}
+		if (!closed)
+		{
+			const auto indices = mapbox::earcut<uint32_t>(rings);
+			std::vector<glm::dvec2> points;
+			for (const auto& ring : rings) points.insert(points.end(), ring.begin(), ring.end());
+			for (size_t i = 0; i < indices.size(); i += 3)
+			{
+				auto a = points[indices[i]], b = points[indices[i + 1]], c = points[indices[i + 2]];
+				if ((b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x) < 0) std::swap(b, c);
+				face(pointAt(a, 0), pointAt(c, 0), pointAt(b, 0));
+				face(pointAt(a, segments), pointAt(b, segments), pointAt(c, segments));
+			}
+		}
+		return geometry;
+	}
+
+	// Connect corresponding sampled edges of the start and end profiles.
+	// End profile placement is already applied by GetProfile; translate only by the spine.
+	inline IfcGeometry ExtrudeTapered(const IfcProfile& start, const IfcProfile& end, glm::dvec3 dir, double depth)
 	{
 		IfcGeometry geom;
-
-		// Normalize the fixed reference direction
-		glm::dvec3 refDir = glm::normalize(fixedReference);
-
-		// Create a transformation matrix to align the profile with the fixed reference
-		glm::dvec3 zAxis(0, 0, 1); // Default profile z-axis
-		glm::dvec3 rotationAxis = glm::cross(zAxis, refDir);
-		double angle = glm::acos(glm::dot(zAxis, refDir));
-		glm::dmat4 orientation = (glm::length(rotationAxis) > EPS_SMALL) ?
-			glm::rotate(glm::dmat4(1.0), angle, rotationAxis) : glm::dmat4(1.0);
-
-		// Sweep the profile along the directrix
-		std::vector<glm::dvec3> profilePoints = profile.curve.points;
-		std::vector<glm::dvec3> pathPoints = directrix.points;
-		uint32_t segments = closed ? pathPoints.size() : pathPoints.size() - 1;
-
-		// Store profiles for start and end caps
-		std::vector<glm::dvec3> startProfile;
-		std::vector<glm::dvec3> endProfile;
-
-		// Compute start profile (at first directrix point)
-		glm::dvec3 startPos = pathPoints[0];
-		for (const auto& pt : profilePoints) {
-			glm::dvec4 transformedPt = orientation * glm::dvec4(pt, 1.0);
-			startProfile.push_back(startPos + glm::dvec3(transformedPt));
+		if (start.isComposite || end.isComposite)
+		{
+			if (!start.isComposite || !end.isComposite || start.profiles.size() != end.profiles.size())
+			{
+				spdlog::error("[ExtrudeTapered()] Incompatible composite profiles");
+				return geom;
+			}
+			for (size_t i = 0; i < start.profiles.size(); ++i)
+				geom.AddGeometry(ExtrudeTapered(start.profiles[i], end.profiles[i], dir, depth));
+			return geom;
 		}
-
-		for (uint32_t i = 0; i < segments; i++) {
-			glm::dvec3 pos = pathPoints[i];
-			glm::dvec3 nextPos = pathPoints[(i + 1) % pathPoints.size()];
-
-			// Transform profile points at the current position
-			std::vector<glm::dvec3> currentProfile;
-			for (const auto& pt : profilePoints) {
-				glm::dvec4 transformedPt = orientation * glm::dvec4(pt, 1.0);
-				currentProfile.push_back(pos + glm::dvec3(transformedPt));
+		if (start.holes.size() != end.holes.size() || glm::length(dir) == 0 || dir.z == 0)
+		{
+			spdlog::error("[ExtrudeTapered()] Incompatible boundaries or extrusion direction");
+			return geom;
+		}
+		const glm::dvec3 offset = glm::normalize(dir) * depth;
+		std::vector<std::vector<glm::dvec2>> lower, upper;
+		for (size_t ring = 0; ring <= start.holes.size(); ++ring)
+		{
+			auto a = ring == 0 ? start.curve.points : start.holes[ring - 1].points;
+			auto b = ring == 0 ? end.curve.points : end.holes[ring - 1].points;
+			if (a.size() > 1 && glm::length(a.front() - a.back()) < 1e-8) a.pop_back();
+			if (b.size() > 1 && glm::length(b.front() - b.back()) < 1e-8) b.pop_back();
+			if (a.size() < 3 || a.size() != b.size())
+			{
+				spdlog::error("[ExtrudeTapered()] Profiles need matching sampled boundary vertices");
+				return IfcGeometry();
 			}
-
-			// Transform profile points at the next position
-			std::vector<glm::dvec3> nextProfile;
-			if (!closed || i < segments - 1) {
-				for (const auto& pt : profilePoints) {
-					glm::dvec4 transformedPt = orientation * glm::dvec4(pt, 1.0);
-					nextProfile.push_back(nextPos + glm::dvec3(transformedPt));
-				}
+			// Reverse both boundaries together to preserve vertex correspondence.
+			double area = 0;
+			for (size_t i = 0; i < a.size(); ++i)
+				area += a[i].x * a[(i + 1) % a.size()].y - a[(i + 1) % a.size()].x * a[i].y;
+			if ((area > 0) != (ring == 0))
+			{
+				std::reverse(a.begin(), a.end());
+				std::reverse(b.begin(), b.end());
 			}
-			else {
-				nextProfile = startProfile; // For closed curves, connect to the start
-			}
-
-			// Store end profile (at last directrix point)
-			if (i == segments - 1) {
-				endProfile = nextProfile;
-			}
-
-			// Add two triangles for each segment of the profile
-			for (size_t j = 0; j < profilePoints.size(); j++) {
-				size_t jNext = (j + 1) % profilePoints.size();
-
-				// First triangle: (current[j], next[j], next[jNext])
-				geom.AddFace(
-					currentProfile[j],
-					nextProfile[j],
-					nextProfile[jNext]
-				);
-
-				// Second triangle: (current[j], next[jNext], current[jNext])
-				geom.AddFace(
-					currentProfile[j],
-					nextProfile[jNext],
-					currentProfile[jNext]
-				);
+			lower.emplace_back(); upper.emplace_back();
+			for (size_t i = 0; i < a.size(); ++i)
+			{
+				lower.back().emplace_back(a[i].x, a[i].y);
+				upper.back().emplace_back(b[i].x, b[i].y);
 			}
 		}
-
-		// Handle caps for non-closed sweeps
-		if (!closed) {
-			// Add start cap
-			IfcProfile startCap = profile;
-			startCap.curve.points = startProfile;
-			geom.AddGeometry(Extrude(startCap, glm::dvec3(0, 0, -1), 0)); // Zero-depth extrusion for cap
-
-			// Add end cap
-			IfcProfile endCap = profile;
-			endCap.curve.points = endProfile;
-			geom.AddGeometry(Extrude(endCap, glm::dvec3(0, 0, 1), 0));
+		auto face = [&](glm::dvec3 a, glm::dvec3 b, glm::dvec3 c)
+		{
+			if (offset.z < 0) std::swap(b, c);
+			geom.AddFace(a, b, c);
+		};
+		for (size_t ring = 0; ring < lower.size(); ++ring)
+		{
+			for (size_t i = 0; i < lower[ring].size(); ++i)
+			{
+				const size_t j = (i + 1) % lower[ring].size();
+				const glm::dvec3 a(lower[ring][i], 0), b(lower[ring][j], 0);
+				const glm::dvec3 c = glm::dvec3(upper[ring][j], 0) + offset;
+				const glm::dvec3 d = glm::dvec3(upper[ring][i], 0) + offset;
+				face(a, b, c); face(a, c, d);
+			}
 		}
-
+		for (int cap = 0; cap < 2; ++cap)
+		{
+			const auto& rings = cap == 0 ? lower : upper;
+			const auto indices = mapbox::earcut<uint32_t>(rings);
+			std::vector<glm::dvec3> points;
+			for (const auto& ring : rings)
+				for (const auto& point : ring)
+					points.push_back(glm::dvec3(point, 0) + (cap == 0 ? glm::dvec3(0) : offset));
+			for (size_t i = 0; i < indices.size(); i += 3)
+			{
+				auto a = points[indices[i]], b = points[indices[i + 1]], c = points[indices[i + 2]];
+				if ((glm::cross(b - a, c - a).z > 0) != (cap == 1)) std::swap(b, c);
+				face(a, b, c);
+			}
+		}
 		return geom;
+	}
+
+	inline IfcGeometry SweepFixedReference(double linearScalingFactor, bool closed, const IfcProfile& profile, const IfcCurve& directrix, const glm::dvec3& fixedReference)
+	{
+        if (profile.isComposite)
+        {
+            IfcGeometry geom;
+            for (const auto& child : profile.profiles)
+                geom.AddGeometry(SweepFixedReference(linearScalingFactor, closed, child, directrix, fixedReference));
+            return geom;
+        }
+        const double tolerance = EPS_SMALL / linearScalingFactor;
+        const double referenceLength = glm::length(fixedReference);
+        if (referenceLength == 0 || !std::isfinite(referenceLength)) return IfcGeometry();
+        const glm::dvec3 reference = fixedReference / referenceLength;
+        std::vector<glm::dvec3> path;
+        for (const auto& point : directrix.points)
+            if (path.empty() || glm::distance(path.back(), point) > tolerance) path.push_back(point);
+        if (path.size() < 2) return IfcGeometry();
+        if (closed && glm::distance(path.front(), path.back()) < tolerance) path.pop_back();
+        if (closed && path.size() < 3) return IfcGeometry();
+
+        std::vector<std::vector<glm::dvec3>> rings{profile.curve.points};
+        for (const auto& hole : profile.holes) rings.push_back(hole.points);
+        for (size_t r = 0; r < rings.size(); ++r)
+        {
+            auto& ring = rings[r];
+            if (ring.size() > 2 && glm::distance(ring.front(), ring.back()) < tolerance) ring.pop_back();
+            if (ring.size() < 3) return IfcGeometry();
+            double area = 0;
+            for (size_t i = 0; i < ring.size(); ++i)
+                area += ring[i].x * ring[(i + 1) % ring.size()].y - ring[(i + 1) % ring.size()].x * ring[i].y;
+            if ((area > 0) != (r == 0)) std::reverse(ring.begin(), ring.end());
+        }
+
+        std::vector<std::vector<std::vector<glm::dvec3>>> sections;
+        for (size_t i = 0; i < path.size(); ++i)
+        {
+            glm::dvec3 tangent;
+            if (!closed && i == 0) tangent = path[1] - path[0];
+            else if (!closed && i + 1 == path.size()) tangent = path[i] - path[i - 1];
+            else tangent = glm::normalize(path[i] - path[(i + path.size() - 1) % path.size()]) +
+                           glm::normalize(path[(i + 1) % path.size()] - path[i]);
+            if (glm::length(tangent) < EPS_SMALL) return IfcGeometry();
+            tangent = glm::normalize(tangent);
+            // IFC defines local X as FixedReference projected onto the plane normal to the tangent.
+            glm::dvec3 xAxis = reference - glm::dot(reference, tangent) * tangent;
+            if (glm::length(xAxis) < EPS_SMALL)
+            {
+                spdlog::warn("[SweepFixedReference()] FixedReference is parallel to the directrix tangent");
+                return IfcGeometry();
+            }
+            xAxis = glm::normalize(xAxis);
+            const glm::dvec3 yAxis = glm::cross(tangent, xAxis);
+            sections.emplace_back();
+            for (const auto& ring : rings)
+            {
+                sections.back().emplace_back();
+                for (const auto& point : ring)
+                    sections.back().back().push_back(path[i] + point.x * xAxis + point.y * yAxis);
+                // Mark rings closed for the shared wall builder; it removes the repeated vertex.
+                sections.back().back().push_back(sections.back().back().front());
+            }
+        }
+        if (closed) sections.push_back(sections.front());
+        IfcGeometry geom = ToIfcGeometry(bimGeometry::SectionedSurfaceRings(sections, false, tolerance));
+        if (!closed)
+        {
+            std::vector<std::vector<glm::dvec2>> polygon;
+            std::vector<glm::dvec2> points;
+            for (const auto& ring : rings)
+            {
+                polygon.emplace_back();
+                for (const auto& point : ring)
+                {
+                    polygon.back().emplace_back(point.x, point.y);
+                    points.emplace_back(point.x, point.y);
+                }
+            }
+            const auto indices = mapbox::earcut<uint32_t>(polygon);
+            for (size_t cap : {size_t(0), sections.size() - 1})
+            {
+                std::vector<glm::dvec3> vertices;
+                for (const auto& ring : sections[cap]) vertices.insert(vertices.end(), ring.begin(), ring.end() - 1);
+                for (size_t i = 0; i + 2 < indices.size(); i += 3)
+                {
+                    auto a = indices[i], b = indices[i + 1], c = indices[i + 2];
+                    const auto u = points[b] - points[a], v = points[c] - points[a];
+                    if ((u.x * v.y - u.y * v.x > 0) != (cap != 0)) std::swap(b, c);
+                    geom.AddFace(vertices[a], vertices[b], vertices[c]);
+                }
+            }
+        }
+        return geom;
 	}
 
 	// TODO: Send to bimGeometry
@@ -826,8 +889,36 @@ namespace webifc::geometry
 	 *
 	 * @return A vector of transformed IfcGeometry objects
 	 */
+	// Adds a transformed triangle. A face normal shared by all three source vertices (see
+	// TriangulateBounds) is carried over, since buildPlanes relies on it to group coplanar triangles.
+	inline void AddTransformedFace(IfcGeometry &target, const IfcGeometry &source, const bimGeometry::Face &f, const glm::dvec3 &a, const glm::dvec3 &b, const glm::dvec3 &c, const glm::dmat3 &normalMatrix, bool transformationBreaksWinding)
+	{
+		const uint32_t facesBefore = target.numFaces;
+		if (transformationBreaksWinding)
+		{
+			target.AddFace(b, a, c);
+		}
+		else
+		{
+			target.AddFace(a, b, c);
+		}
+		const glm::dvec3 sharedNormal = source.GetVertexNormal(f.i0);
+		if (target.numFaces == facesBefore || sharedNormal != source.GetVertexNormal(f.i1) || sharedNormal != source.GetVertexNormal(f.i2))
+		{
+			return;
+		}
+		const glm::dvec3 normal = glm::normalize(normalMatrix * sharedNormal);
+		for (uint32_t i = target.numPoints - 3; i < target.numPoints; i++)
+		{
+			target.vertexData[i * VERTEX_FORMAT_SIZE_FLOATS + 3] = normal.x;
+			target.vertexData[i * VERTEX_FORMAT_SIZE_FLOATS + 4] = normal.y;
+			target.vertexData[i * VERTEX_FORMAT_SIZE_FLOATS + 5] = normal.z;
+		}
+	}
+
 	inline std::vector<IfcGeometry> transformIfcGeometry(const IfcGeometry &sourceGeom, glm::dmat4 matrix, bool transformationBreaksWinding)
 	{
+		const glm::dmat3 normalMatrix = glm::transpose(glm::inverse(glm::dmat3(matrix)));
 		std::vector<IfcGeometry> geomsTransformed;
 		if (sourceGeom.part.size() > 0)
 		{
@@ -854,14 +945,7 @@ namespace webifc::geometry
 						glm::dvec3 b = matrix * glm::dvec4(newMeshGeom.GetPoint(f.i1), 1);
 						glm::dvec3 c = matrix * glm::dvec4(newMeshGeom.GetPoint(f.i2), 1);
 
-						if (transformationBreaksWinding)
-						{
-							newGeom.AddFace(b, a, c);
-						}
-						else
-						{
-							newGeom.AddFace(a, b, c);
-						}
+						AddTransformedFace(newGeom, newMeshGeom, f, a, b, c, normalMatrix, transformationBreaksWinding);
 					}
 
 					geomsTransformed.push_back(newGeom);
@@ -889,14 +973,7 @@ namespace webifc::geometry
 					glm::dvec3 b = matrix * glm::dvec4(sourceGeom.GetPoint(f.i1), 1);
 					glm::dvec3 c = matrix * glm::dvec4(sourceGeom.GetPoint(f.i2), 1);
 
-					if (transformationBreaksWinding)
-					{
-						newGeom.AddFace(b, a, c);
-					}
-					else
-					{
-						newGeom.AddFace(a, b, c);
-					}
+					AddTransformedFace(newGeom, sourceGeom, f, a, b, c, normalMatrix, transformationBreaksWinding);
 				}
 
 				geomsTransformed.push_back(newGeom);

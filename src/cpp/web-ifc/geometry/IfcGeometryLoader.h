@@ -6,6 +6,7 @@
 
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <optional>
 #include <cstdint>
@@ -32,11 +33,16 @@ namespace webifc::geometry
     glm::dmat4 GetLocalPlacement(const uint32_t expressID, glm::dvec3 vector = glm::dvec3(1)) const;
     glm::dvec3 GetCartesianPoint3D(const uint32_t expressID) const;
     glm::dvec2 GetCartesianPoint2D(const uint32_t expressID) const;
+    glm::dvec3 GetDirection(const uint32_t expressID) const;
     glm::dvec3 GetVector(const uint32_t expressID) const;
     IfcProfile GetProfile(uint32_t expressID) const;
     IfcProfile GetProfile3D(uint32_t expressID) const;
     IfcCurve GetLocalCurve(uint32_t expressID) const;
     IfcCurve GetCurve(uint32_t expressID, uint8_t dimensions, bool edge = false) const;
+    bool GetCompositeCurveParameters(uint32_t expressID, uint8_t dimensions, IfcCurve &curve, std::vector<double> &parameters) const;
+    bool GetCompositeSegmentParameterSpan(uint32_t curveID, uint8_t dimensions, size_t pointCount, double &span) const;
+
+    IfcCurve GetCurveWithParameters(uint32_t expressID, uint8_t dimensions, std::optional<double> start, std::optional<double> end) const;
 
     // Helper function to compute the total length of the curve
     double ComputeCurveLength(const IfcCurve &curve) const;
@@ -71,35 +77,39 @@ namespace webifc::geometry
     glm::dmat4 GetRelativePlacement(uint32_t placementID) const;
 
   private:
+    mutable std::unordered_set<uint32_t> _activePlacements;
     IfcCurve GetAlignmentCurve(uint32_t expressID, uint32_t parentExpressID = -1) const;
     IfcProfile GetProfileByLine(uint32_t expressID) const;
     glm::dvec3 GetVertexPoint(uint32_t expressID) const;
     IfcTrimmingSelect GetTrimSelect(uint32_t DIM, std::vector<uint32_t> &tapeOffsets) const;
 
-    struct ComputeCurveParams
-    {
-      ComputeCurveParams() = default;
-      ComputeCurveParams(const ComputeCurveParams &other)
-      {
-        dimensions = other.dimensions;
-        ignorePlacement = other.ignorePlacement;
-        edge = other.edge;
-        sameSense = other.sameSense;
-        hasTrim = other.hasTrim;
-        trimStart = other.trimStart;
-        trimEnd = other.trimEnd;
-        trimSense = other.trimSense;
-      }
-      uint8_t dimensions = 2;
-      bool ignorePlacement = false;
-      bool edge = false;
-      int sameSense = -1;
-      bool hasTrim = false;
-      IfcTrimmingSelect trimStart;
-      IfcTrimmingSelect trimEnd;
-      TrimSense trimSense = TRIM_SENSE_SAME;
+    struct ComputeCurveParams {
+		ComputeCurveParams() = default;
+		ComputeCurveParams(const ComputeCurveParams& other) {
+			dimensions = other.dimensions;
+			ignorePlacement = other.ignorePlacement;
+			ignoreLineDirection = other.ignoreLineDirection;
+			applyParentPlacement = other.applyParentPlacement;
+			edge = other.edge;
+			sameSense = other.sameSense;
+			hasTrim = other.hasTrim;
+            trimStart = other.trimStart;
+            trimEnd = other.trimEnd;
+            trimSense = other.trimSense;
+        }
+        uint8_t dimensions = 2;
+        bool ignorePlacement = false;
+		bool ignoreLineDirection = false;
+		bool applyParentPlacement = false;
+        bool edge = false;
+        int sameSense = -1;
+       	bool hasTrim = false;
+       	IfcTrimmingSelect trimStart;
+       	IfcTrimmingSelect trimEnd;
+        TrimSense trimSense = TRIM_SENSE_SAME;
     };
-    void ComputeCurve(uint32_t expressID, IfcCurve &curve, const ComputeCurveParams &params) const;
+    void ComputeCurve(uint32_t expressID, IfcCurve &curve, const ComputeCurveParams& params) const;
+    void ComputeCurve(uint32_t expressID, IfcCurve &curve, const ComputeCurveParams& params, uint32_t lineType) const;
     void convertAngleUnits(double &Degrees, double &Rad) const;
     double ReadLenghtMeasure() const;
     void ReadCurveMeasureSelect(IfcTrimmingSelect &trim) const;

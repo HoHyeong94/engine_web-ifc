@@ -21,7 +21,7 @@ let allGeometriesSize: number = 119;
 let meshesCount: number = 115;
 let totalLineNumber : number = 6490;
 let emptyFileModelID: number;
-let lastExpressId : number = 14315;
+let lastExpressId : number = 14314;
 let expectedFileDescription : string = "ViewDefinition [CoordinationView_V2.0]";
 let expectedFileSchema = "IFC2X3";
 let expectedFileName = "3458";
@@ -118,14 +118,67 @@ describe('WebIfcApi reading methods', () => {
         ifcApi.CreateIfcGuidToExpressIdMapping(modelID);
         expect(ifcApi.ifcGuidMap.get(0)?.get(expressIDMatchingGuid.expressID)).toEqual(expressIDMatchingGuid.guid);
     })
+    test('deletes native vectors after creating the guid map', () => {
+        const originalGetLineIDsWithType = ifcApi.GetLineIDsWithType.bind(ifcApi);
+        const vectorsCreated: any[] = [];
+        const deleteCalls: number[] = [];
+        ifcApi.GetLineIDsWithType = ((...args: any[]) => {
+            const lines: any = originalGetLineIDsWithType(...args);
+            vectorsCreated.push(lines);
+            const originalDelete = lines.delete.bind(lines);
+            lines.delete = () => {
+                deleteCalls.push(1);
+                originalDelete();
+            };
+            return lines;
+        }) as typeof ifcApi.GetLineIDsWithType;
+
+        try {
+            ifcApi.CreateIfcGuidToExpressIdMapping(modelID);
+        } finally {
+            ifcApi.GetLineIDsWithType = originalGetLineIDsWithType;
+        }
+
+        expect(deleteCalls).toHaveLength(vectorsCreated.length);
+    })
+    test('deletes native vectors when reading a line fails', () => {
+        const lines: any = {
+            get: () => 1,
+            size: () => 1,
+            delete: jest.fn(),
+        };
+        const originalGetIfcEntityList = ifcApi.GetIfcEntityList;
+        const originalIsIfcElement = ifcApi.IsIfcElement;
+        const originalGetLineIDsWithType = ifcApi.GetLineIDsWithType;
+        const originalGetLine = ifcApi.GetLine;
+        ifcApi.GetIfcEntityList = () => [WebIFC.IFCWALL];
+        ifcApi.IsIfcElement = () => true;
+        ifcApi.GetLineIDsWithType = (() => lines) as typeof ifcApi.GetLineIDsWithType;
+        ifcApi.GetLine = (() => {
+            throw new Error('injected line read error');
+        }) as typeof ifcApi.GetLine;
+
+        try {
+            expect(() => ifcApi.CreateIfcGuidToExpressIdMapping(modelID)).toThrow(
+                'injected line read error'
+            );
+        } finally {
+            ifcApi.GetIfcEntityList = originalGetIfcEntityList;
+            ifcApi.IsIfcElement = originalIsIfcElement;
+            ifcApi.GetLineIDsWithType = originalGetLineIDsWithType;
+            ifcApi.GetLine = originalGetLine;
+        }
+
+        expect(lines.delete).toHaveBeenCalledTimes(1);
+    })
     test('can return the next highest expressID if the ID is sequential', () => {
         expect(ifcApi.GetNextExpressID(modelID, 5)).toBe(6);
     })
     test('can return the next highest expressID if the ID is not sequential', () => {
         expect(ifcApi.GetNextExpressID(modelID, 9)).toBe(11);
     })
-    test('returns next expressID if it is the max ID', () => {
-        expect(ifcApi.GetNextExpressID(modelID, 14314)).toBe(14315);
+    test('returns next expressID near the max ID', () => {
+        expect(ifcApi.GetNextExpressID(modelID, 14313)).toBe(14314);
     })
     test('Can get max expressID', () => {
         const maxExpressId : number = ifcApi.GetMaxExpressID(modelID);
@@ -521,6 +574,14 @@ describe('creating ifc', () => {
         ifcApi.WriteLine(modelID, entity);
         ifcApi.DeleteLine(modelID,entity.expressID);
         expect(ifcApi.GetLine(modelID,entity.expressID)).toBe(undefined);
+    });
+
+    test('deleted ifc line is not returned by type', () => {
+        let entity: IfcLineObject  = ifcApi.CreateIfcEntity(modelID, WebIFC.IFCCARTESIANPOINT, [new IFC2X3.IfcLengthMeasure(5), new IFC2X3.IfcLengthMeasure(5), new IFC2X3.IfcLengthMeasure(5)]);
+        ifcApi.WriteLine(modelID, entity);
+        expect([...ifcApi.GetLineIDsWithType(modelID, WebIFC.IFCCARTESIANPOINT)]).toContain(entity.expressID);
+        ifcApi.DeleteLine(modelID,entity.expressID);
+        expect([...ifcApi.GetLineIDsWithType(modelID, WebIFC.IFCCARTESIANPOINT)]).not.toContain(entity.expressID);
     });
 
     

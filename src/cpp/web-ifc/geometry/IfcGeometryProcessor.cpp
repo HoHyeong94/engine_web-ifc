@@ -2,6 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+#include <algorithm>
+#include <limits>
+
 #include <spdlog/spdlog.h>
 
 #if defined(DEBUG_DUMP_SVG) || defined(DUMP_CSG_MESHES)
@@ -10,6 +13,13 @@
 #endif
 
 #include "IfcGeometryProcessor.h"
+
+// Enable the N-ary DIFFERENCE flatten optimization for the Tekla coplanar-cut
+// pattern (model 1092: naked -47%, non-manifold -63%). Gated internally to all-
+// extrusion, same-direction, non-faceted cutter chains so it can't touch the
+// cases it doesn't help. Comment this line out to fall back to nested subtraction.
+#define NARY_UNION 1
+
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtx/transform.hpp>
 #include "representation/geometry.h"
@@ -17,6 +27,7 @@
 #include "operations/curve-utils.h"
 #include "operations/mesh_utils.h"
 #include "operations/boolean-utils/fuzzy-bools.h"
+#include "operations/plane-clip.h"
 #include <atomic>
 
 namespace
@@ -82,9 +93,20 @@ namespace
     //
     // The conditions mirror `NurbsFace::is_well_formed` on the Rust side, which
     // is the consumer that would otherwise do the rejecting.
+    //
+    // `geom` must be the geometry that OUTLIVES the face: since 0.79 the caller
+    // tessellates into a per-face scratch `faceGeometry` and copies only its
+    // triangles out, so a face retained into that scratch would be dropped with
+    // it — retained (so not tessellated) yet stored nowhere.
+    //
+    // `sameSense` is the face's IfcFaceSurface.SameSense: whether the face's
+    // outward side agrees with the surface's own dS/du x dS/dv normal. 0.79
+    // applies it to the triangles it bakes; a retained face has no triangles,
+    // so it is carried with the parameters instead.
     bool RetainBSplineFace(webifc::geometry::IfcGeometry &geom,
                            const webifc::geometry::IfcSurface &surface,
-                           const std::vector<webifc::geometry::IfcBound3D> &bounds)
+                           const std::vector<webifc::geometry::IfcBound3D> &bounds,
+                           bool sameSense)
     {
         const auto &b = surface.BSplineSurface;
 
@@ -128,6 +150,7 @@ namespace
         // the loader buffer and would dangle once retention outlives the parse.
         f.ClosedU = (b.ClosedU == "T" || b.ClosedU == ".T.");
         f.ClosedV = (b.ClosedV == "T" || b.ClosedV == ".T.");
+        f.SameSense = sameSense;
         f.ControlPoints = b.ControlPoints;
         f.Weights = b.Weights;
         f.UMultiplicity = b.UMultiplicity;
@@ -158,9 +181,10 @@ namespace webifc::geometry
     bool GetSkipRelVoidsBoolean() { return g_skipRelVoidsBoolean; }
 }
 
-
 namespace webifc::geometry
 {
+    constexpr size_t MAPPED_REPRESENTATION_CACHE_BYTE_LIMIT = 32 * 1024 * 1024;
+    constexpr size_t MAPPED_REPRESENTATION_CACHE_ENTRY_LIMIT = 4096;
     
     double BOOLSTATUS = 0;
 
@@ -202,8 +226,13 @@ namespace webifc::geometry
         return _expressIDToGeometry[expressID];
     }
 
-    void IfcGeometryProcessor::Clear()
+    void IfcGeometryProcessor::Clear(bool keepMappedRepresentations)
     {
+        if (!keepMappedRepresentations)
+        {
+            _mappedRepresentations.clear();
+            _mappedRepresentationsBytes = 0;
+        }
         _expressIDToGeometry.clear();
         std::unordered_map<uint32_t, IfcGeometry>().swap(_expressIDToGeometry);
         _cache.Clear();
@@ -313,10 +342,70 @@ namespace webifc::geometry
         return styledItemColor;
     }
 
+    void IfcGeometryProcessor::SetSkippedItems(const std::unordered_map<uint32_t, glm::dvec3> *items, bool skipVoids)
+    {
+        _skippedItems = items;
+        _skipVoids = skipVoids;
+    }
+
     IfcComposedMesh IfcGeometryProcessor::GetMesh(uint32_t expressID)
     {
+        const auto lineType = _loader.GetLineType(expressID);
+        if (lineType != schema::IFCREPRESENTATIONMAP) return GetMeshUncached(expressID, lineType);
+        if (_mappedRepresentationsRevision != _loader.GetRevision())
+        {
+            _mappedRepresentations.clear();
+            _mappedRepresentationsBytes = 0;
+            _mappedRepresentationsRevision = _loader.GetRevision();
+        }
+        auto found = _mappedRepresentations.find(expressID);
+        if (found != _mappedRepresentations.end())
+        {
+            for (const auto& [id, geometry] : found->second.geometries) _expressIDToGeometry[id] = geometry;
+            return found->second.mesh;
+        }
+        auto mesh = GetMeshUncached(expressID, lineType);
+        std::vector<std::pair<uint32_t, const IfcGeometry*>> geometries;
+        size_t bytes = 0;
+        auto capture = [&](auto&& self, const IfcComposedMesh& node) -> bool
+        {
+            bytes += sizeof(IfcComposedMesh);
+            if (node.hasGeometry)
+            {
+                auto found = _expressIDToGeometry.find(node.expressID);
+                if (found == _expressIDToGeometry.end()) return false;
+                const auto& g = found->second;
+                if (!g.part.empty() || !g.sweptDiskSolid.profiles.empty() || !g.sweptDiskSolid.axis.empty()) return false;
+                bytes += sizeof(IfcGeometry) + g.vertexData.size() * sizeof(double)
+                    + g.fvertexData.size() * sizeof(float) + g.indexData.size() * sizeof(uint32_t)
+                    + g.planeData.size() * sizeof(uint32_t) + g.planes.size() * sizeof(bimGeometry::Plane);
+                if (bytes > MAPPED_REPRESENTATION_CACHE_BYTE_LIMIT) return false;
+                geometries.emplace_back(node.expressID, &g);
+            }
+            for (const auto& child : node.children) if (!self(self, child)) return false;
+            return true;
+        };
+        if (capture(capture, mesh) && bytes <= MAPPED_REPRESENTATION_CACHE_BYTE_LIMIT)
+        {
+            if (_mappedRepresentationsBytes + bytes > MAPPED_REPRESENTATION_CACHE_BYTE_LIMIT
+                || _mappedRepresentations.size() >= MAPPED_REPRESENTATION_CACHE_ENTRY_LIMIT)
+            {
+                _mappedRepresentations.clear();
+                _mappedRepresentationsBytes = 0;
+            }
+            MappedRepresentation entry;
+            entry.mesh = mesh;
+            entry.geometries.reserve(geometries.size());
+            for (const auto& [id, geometry] : geometries) entry.geometries.emplace_back(id, *geometry);
+            _mappedRepresentations.emplace(expressID, std::move(entry));
+            _mappedRepresentationsBytes += bytes;
+        }
+        return mesh;
+    }
+
+    IfcComposedMesh IfcGeometryProcessor::GetMeshUncached(uint32_t expressID, uint32_t lineType)
+    {
         spdlog::debug("[GetMesh({})]", expressID);
-        auto lineType = _loader.GetLineType(expressID);
         auto &relVoids = _cache.GetRelVoids();
 
         IfcComposedMesh mesh;
@@ -334,6 +423,29 @@ namespace webifc::geometry
         }
 
         mesh.transformation = glm::dmat4(1);
+
+        if (_skippedItems && _skippedItems->count(expressID))
+        {
+            // A boolean takes its first operand's style when it has none of its own (as the full
+            // path below does, operand by operand); a skipped item never reaches that code, so the
+            // chain of first operands is walked here for the colour alone.
+            uint32_t operand = expressID;
+            for (int depth = 0; !mesh.hasColor && depth < 32; depth++)
+            {
+                const auto t = _loader.GetLineType(operand);
+                if (t != schema::IFCBOOLEANRESULT && t != schema::IFCBOOLEANCLIPPINGRESULT) break;
+                _loader.MoveToArgumentOffset(operand, 1);
+                operand = _loader.GetRefArgument();
+                if (auto c = GetStyleItemFromExpressId(operand))
+                {
+                    mesh.color = c.value();
+                    mesh.hasColor = true;
+                }
+            }
+            _expressIDToGeometry[expressID] = IfcGeometry();
+            mesh.hasGeometry = true;
+            return mesh;
+        }
 
         if (_schemaManager.IsIfcElement(lineType))
         {
@@ -370,7 +482,9 @@ namespace webifc::geometry
             // g_skipRelVoidsBoolean at the top of this file. When skipped the
             // host falls through to the plain-mesh path below, exactly as if
             // it had no voids.
-            if (relVoidsIt != relVoids.end() && !relVoidsIt->second.empty() && !g_skipRelVoidsBoolean)
+            // 0.79's `_skipVoids` (an alternative engine owns the openings) and
+            // our switch are independent; either one skips the subtraction.
+            if (!_skipVoids && relVoidsIt != relVoids.end() && !relVoidsIt->second.empty() && !g_skipRelVoidsBoolean)
             {
                 auto origin = GetOrigin(mesh, _expressIDToGeometry);
                 auto normalizeMat = glm::translate(-origin);
@@ -436,7 +550,7 @@ namespace webifc::geometry
             case schema::IFCSECTIONEDSOLID:
             case schema::IFCSECTIONEDSURFACE:
             {
-                auto geom = SectionedSurface(_geometryLoader.GetCrossSections3D(expressID),EPS_SMALL);
+                auto geom = SectionedSurface(_geometryLoader.GetCrossSections3D(expressID), lineType != schema::IFCSECTIONEDSURFACE);
 
                 mesh.transformation = glm::dmat4(1);
                 
@@ -469,6 +583,75 @@ namespace webifc::geometry
                 uint32_t firstOperandID = _loader.GetRefArgument();
                 uint32_t secondOperandID = _loader.GetRefArgument();
 
+                // DEEP-CHAIN FLATTEN (fixes #1197; also helps deep-chain #1774/#1999): Tekla/Revit
+                // emit (((base - c1) - c2) - ... - cn) as a spine of nested clippings. Processing it
+                // recursively re-runs a full CSG pass per level over the growing result -> ~O(n^2),
+                // which hangs (#1197: StreamAllMeshesWithTypes never completes; 35 half-space clips)
+                // or blows the WASM stack on very long chains (#1774: 1175 extrusion cuts). For a pure-DIFFERENCE
+                // chain, collect the spine iteratively and keep one normalization frame.
+                // BoolProcess still subtracts each cutter sequentially. Faceted/BRep cutters
+                // must retain the original inner-to-outer order; reversing them corrupts meshes.
+                // Gated on depth>=8 so normal shallow booleans are untouched.
+                {
+                    auto isFacetedCut = [&](uint32_t id) {
+                        auto t = _loader.GetLineType(id);
+                        return t == schema::IFCPOLYGONALFACESET || t == schema::IFCTRIANGULATEDFACESET ||
+                               t == schema::IFCFACETEDBREP || t == schema::IFCFACEBASEDSURFACEMODEL ||
+                               t == schema::IFCSHELLBASEDSURFACEMODEL || t == schema::IFCCONNECTEDFACESET;
+                    };
+                    std::vector<uint32_t> cutterIDs;
+                    uint32_t baseID = firstOperandID;
+                    bool nonFaceted = !isFacetedCut(secondOperandID);
+                    cutterIDs.push_back(secondOperandID);
+                    while (true)
+                    {
+                        auto lt = _loader.GetLineType(baseID);
+                        if (lt == schema::IFCBOOLEANCLIPPINGRESULT)
+                        {
+                            _loader.MoveToArgumentOffset(baseID, 1);
+                            uint32_t f = _loader.GetRefArgument();
+                            uint32_t s = _loader.GetRefArgument();
+                            cutterIDs.push_back(s); if (isFacetedCut(s)) nonFaceted = false; baseID = f;
+                        }
+                        else if (lt == schema::IFCBOOLEANRESULT)
+                        {
+                            _loader.MoveToArgumentOffset(baseID, 0);
+                            std::string_view bop = _loader.GetStringArgument();
+                            if (bop != "DIFFERENCE") break;
+                            uint32_t f = _loader.GetRefArgument();
+                            uint32_t s = _loader.GetRefArgument();
+                            cutterIDs.push_back(s); if (isFacetedCut(s)) nonFaceted = false; baseID = f;
+                        }
+                        else break;
+                    }
+                    if (cutterIDs.size() >= 8)
+                    {
+                        auto baseMesh = GetMesh(baseID);
+                        auto origin2 = GetOrigin(baseMesh, _expressIDToGeometry);
+                        auto normalizeMat2 = glm::translate(-origin2);
+                        auto flatBase = flatten(baseMesh, _expressIDToGeometry, normalizeMat2);
+                        if (flatBase.size() != 0)
+                        {
+                            std::vector<IfcGeometry> flatCuts;
+                            // The spine was collected outermost first. Faceted cuts need
+                            // their original sequential order and a stable normalization frame.
+                            if (!nonFaceted) std::reverse(cutterIDs.begin(), cutterIDs.end());
+                            for (auto cid : cutterIDs)
+                            {
+                                auto cm = GetMesh(cid);
+                                auto fc = flatten(cm, _expressIDToGeometry, normalizeMat2);
+                                for (auto &g : fc) flatCuts.push_back(g);
+                            }
+                            IfcGeometry resultMesh = BoolProcess(flatBase, flatCuts, "DIFFERENCE", _settings);
+                            _expressIDToGeometry[expressID] = resultMesh;
+                            mesh.hasGeometry = true;
+                            mesh.transformation = glm::translate(origin2);
+                            if (!mesh.hasColor && baseMesh.hasColor) { mesh.hasColor = true; mesh.color = baseMesh.color; }
+                            return mesh;
+                        }
+                    }
+                }
+
                 auto firstMesh = GetMesh(firstOperandID);
                 auto secondMesh = GetMesh(secondOperandID);
 
@@ -476,9 +659,26 @@ namespace webifc::geometry
                 auto normalizeMat = glm::translate(-origin);
 
                 auto flatFirstMeshes = flatten(firstMesh, _expressIDToGeometry, normalizeMat);
-                auto flatSecondMeshes = flatten(secondMesh, _expressIDToGeometry, normalizeMat);
 
-                IfcGeometry resultMesh = BoolProcess(flatFirstMeshes, flatSecondMeshes, "DIFFERENCE", _settings);
+                // An unbounded half-space is one plane: cut and cap instead of subtracting a 50 m
+                // prism (see plane-clip.h). AgreementFlag TRUE: the plane's normal points away from
+                // the half-space's material, which is the side removed, so the normal side is kept.
+                IfcGeometry resultMesh;
+                bool clipped = false;
+                if (PlaneClipEnabled() && _loader.GetLineType(secondOperandID) == schema::IFCHALFSPACESOLID)
+                {
+                    _loader.MoveToArgumentOffset(secondOperandID, 1);
+                    const bool agreement = _loader.GetStringArgument() == "T";
+                    const glm::dmat4 m = normalizeMat * secondMesh.transformation;
+                    const glm::dvec3 planePoint = glm::dvec3(m * glm::dvec4(0, 0, 0, 1));
+                    const glm::dvec3 planeNormal = glm::dvec3(m * glm::dvec4(0, 0, 1, 0));
+                    clipped = ClipByPlane(flatFirstMeshes, planePoint, agreement ? planeNormal : -planeNormal, resultMesh);
+                }
+                if (!clipped)
+                {
+                    auto flatSecondMeshes = flatten(secondMesh, _expressIDToGeometry, normalizeMat);
+                    resultMesh = BoolProcess(flatFirstMeshes, flatSecondMeshes, "DIFFERENCE", _settings);
+                }
 
                 _expressIDToGeometry[expressID] = resultMesh;
                 mesh.hasGeometry = true;
@@ -499,7 +699,7 @@ namespace webifc::geometry
                 _loader.MoveToArgumentOffset(expressID, 0);
                 std::string_view op = _loader.GetStringArgument();
 
-                if (op != "DIFFERENCE" && op != "UNION")
+                if (op != "DIFFERENCE" && op != "UNION" && op != "INTERSECTION")
                 {
                     spdlog::error("[GetMesh()] Unsupported boolean op {}", std::string(op), expressID);
                     return mesh;
@@ -508,6 +708,190 @@ namespace webifc::geometry
                 uint32_t firstOperandID = _loader.GetRefArgument();
                 uint32_t secondOperandID = _loader.GetRefArgument();
 
+                // DEEP-CHAIN FLATTEN (perf, same rationale as IFCBOOLEANCLIPPINGRESULT above):
+                // a long pure-DIFFERENCE spine (#1774: 1175 nested IfcBooleanResult extrusion cuts)
+                // hangs when processed recursively (one CSG pass per level). Collect the whole
+                // DIFFERENCE spine iteratively and pass it to the sequential BoolProcess in one
+                // normalization frame. Preserve inner-to-outer order for faceted cutters; shallow
+                // chains and the existing non-faceted ordering remain unchanged.
+                if (op == "DIFFERENCE")
+                {
+                    auto isFacetedCut = [&](uint32_t id) {
+                        auto t = _loader.GetLineType(id);
+                        return t == schema::IFCPOLYGONALFACESET || t == schema::IFCTRIANGULATEDFACESET ||
+                               t == schema::IFCFACETEDBREP || t == schema::IFCFACEBASEDSURFACEMODEL ||
+                               t == schema::IFCSHELLBASEDSURFACEMODEL || t == schema::IFCCONNECTEDFACESET;
+                    };
+                    std::vector<uint32_t> cutterIDs;
+                    uint32_t baseID = firstOperandID;
+                    bool nonFaceted = !isFacetedCut(secondOperandID);
+                    cutterIDs.push_back(secondOperandID);
+                    while (true)
+                    {
+                        auto lt = _loader.GetLineType(baseID);
+                        if (lt == schema::IFCBOOLEANCLIPPINGRESULT)
+                        {
+                            _loader.MoveToArgumentOffset(baseID, 1);
+                            uint32_t f = _loader.GetRefArgument();
+                            uint32_t s = _loader.GetRefArgument();
+                            cutterIDs.push_back(s); if (isFacetedCut(s)) nonFaceted = false; baseID = f;
+                        }
+                        else if (lt == schema::IFCBOOLEANRESULT)
+                        {
+                            _loader.MoveToArgumentOffset(baseID, 0);
+                            std::string_view bop = _loader.GetStringArgument();
+                            if (bop != "DIFFERENCE") break;
+                            uint32_t f = _loader.GetRefArgument();
+                            uint32_t s = _loader.GetRefArgument();
+                            cutterIDs.push_back(s); if (isFacetedCut(s)) nonFaceted = false; baseID = f;
+                        }
+                        else break;
+                    }
+                    if (cutterIDs.size() >= 8)
+                    {
+                        auto baseMesh = GetMesh(baseID);
+                        auto origin2 = GetOrigin(baseMesh, _expressIDToGeometry);
+                        auto normalizeMat2 = glm::translate(-origin2);
+                        auto flatBase = flatten(baseMesh, _expressIDToGeometry, normalizeMat2);
+                        if (flatBase.size() != 0)
+                        {
+                            std::vector<IfcGeometry> flatCuts;
+                            // The spine was collected outermost first. Faceted cuts need
+                            // their original sequential order and a stable normalization frame.
+                            if (!nonFaceted) std::reverse(cutterIDs.begin(), cutterIDs.end());
+                            for (auto cid : cutterIDs)
+                            {
+                                auto cm = GetMesh(cid);
+                                auto fc = flatten(cm, _expressIDToGeometry, normalizeMat2);
+                                for (auto &g : fc) flatCuts.push_back(g);
+                            }
+                            IfcGeometry resultMesh = BoolProcess(flatBase, flatCuts, "DIFFERENCE", _settings);
+                            _expressIDToGeometry[expressID] = resultMesh;
+                            mesh.hasGeometry = true;
+                            mesh.transformation = glm::translate(origin2);
+                            if (!mesh.hasColor && baseMesh.hasColor) { mesh.hasColor = true; mesh.color = baseMesh.color; }
+                            return mesh;
+                        }
+                    }
+                }
+
+#ifdef NARY_UNION
+                // N-ARY DIFFERENCE for the Tekla coplanar-cut pattern (model 1092): a
+                // pure-DIFFERENCE spine of EXTRUSION cutters over an EXTRUSION base.
+                // Subtracting coaxial/coplanar extrusions one-by-one piles faces on
+                // shared planes, which CDT then drops (naked edges). Flattening the whole
+                // spine and subtracting every cutter in a single pass avoids that.
+                // Restricted to all-extrusion operands on purpose: faceset/brep cutters
+                // (e.g. the IfcBuildingElementPart parts in model 1256) already mesh
+                // cleanly the sequential way and the flattened path corrupts them, so
+                // those fall through to the exact nested baseline below.
+                auto isFaceted = [&](uint32_t id) {
+                    auto t = _loader.GetLineType(id);
+                    return t == schema::IFCPOLYGONALFACESET || t == schema::IFCTRIANGULATEDFACESET ||
+                           t == schema::IFCFACETEDBREP || t == schema::IFCFACEBASEDSURFACEMODEL ||
+                           t == schema::IFCSHELLBASEDSURFACEMODEL || t == schema::IFCCONNECTEDFACESET;
+                };
+                std::vector<uint32_t> cutterIDs;
+                uint32_t baseID = firstOperandID;
+                bool noFacetedCutter = true;
+                if (op == "DIFFERENCE")
+                {
+                    cutterIDs.push_back(secondOperandID);
+                    if (isFaceted(secondOperandID)) noFacetedCutter = false;
+                    while (true)
+                    {
+                        auto lt = _loader.GetLineType(baseID);
+                        if (lt == schema::IFCBOOLEANCLIPPINGRESULT)
+                        {
+                            _loader.MoveToArgumentOffset(baseID, 1);
+                            uint32_t f = _loader.GetRefArgument();
+                            uint32_t sec = _loader.GetRefArgument();
+                            cutterIDs.push_back(sec);
+                            if (isFaceted(sec)) noFacetedCutter = false;
+                            baseID = f;
+                        }
+                        else if (lt == schema::IFCBOOLEANRESULT)
+                        {
+                            _loader.MoveToArgumentOffset(baseID, 0);
+                            std::string_view bop = _loader.GetStringArgument();
+                            if (bop != "DIFFERENCE") break;
+                            uint32_t f = _loader.GetRefArgument();
+                            uint32_t sec = _loader.GetRefArgument();
+                            cutterIDs.push_back(sec);
+                            if (isFaceted(sec)) noFacetedCutter = false;
+                            baseID = f;
+                        }
+                        else break;
+                    }
+                }
+                bool baseIsExtrude = (_loader.GetLineType(baseID) == schema::IFCEXTRUDEDAREASOLID);
+
+                // Only fuse when the flatten actually helps: the coplanar-cut pattern has
+                // every direct-extrusion cutter sharing the base extrusion's direction
+                // (Tekla emits one IfcDirection reused by base + cutts => coaxial/coplanar
+                // walls). Cutters extruded along OTHER directions (e.g. 1194 #424) don't
+                // pile on shared planes, so the one-pass flatten only makes them slightly
+                // worse; leave those on the nested baseline. Boolean-result cutters have no
+                // direction of their own and are allowed (they resolve to coaxial subtrees).
+                bool sameDir = true;
+                if (baseIsExtrude)
+                {
+                    _loader.MoveToArgumentOffset(baseID, 2);
+                    uint32_t baseDir = _loader.GetRefArgument();
+                    for (auto cid : cutterIDs)
+                    {
+                        if (_loader.GetLineType(cid) == schema::IFCEXTRUDEDAREASOLID)
+                        {
+                            _loader.MoveToArgumentOffset(cid, 2);
+                            if (_loader.GetRefArgument() != baseDir) { sameDir = false; break; }
+                        }
+                    }
+                }
+                bool useNary = (op == "DIFFERENCE") && baseIsExtrude && noFacetedCutter && sameDir && cutterIDs.size() > 1;
+
+                IfcComposedMesh firstMesh;
+                glm::dvec3 origin;
+                IfcGeometry resultMesh;
+
+                if (useNary)
+                {
+                    firstMesh = GetMesh(baseID);
+                    origin = GetOrigin(firstMesh, _expressIDToGeometry);
+                    auto normalizeMat = glm::translate(-origin);
+                    auto flatFirstMeshes = flatten(firstMesh, _expressIDToGeometry, normalizeMat);
+                    if (flatFirstMeshes.size() == 0) return mesh;
+                    double baseVol = 0.0;
+                    for (auto &g : flatFirstMeshes) baseVol += g.Volume();
+                    bool baseNeg = baseVol < 0.0;
+                    std::vector<IfcGeometry> flatSecondMeshes;
+                    for (auto cid : cutterIDs)
+                    {
+                        auto cMesh = GetMesh(cid);
+                        auto flatC = flatten(cMesh, _expressIDToGeometry, normalizeMat);
+                        for (auto &g : flatC)
+                        {
+                            // Match each cutter's winding to the base's before the flattened
+                            // one-pass subtraction (defensive; the testReverse bugfix already
+                            // prevents the collateral inversions, but this keeps the fused
+                            // cut orientation consistent). Validated version.
+                            if (!g.halfSpace && (g.Volume() < 0.0) != baseNeg) g.ReverseFaces();
+                            flatSecondMeshes.push_back(g);
+                        }
+                    }
+                    resultMesh = BoolProcess(flatFirstMeshes, flatSecondMeshes, "DIFFERENCE", _settings);
+                }
+                else
+                {
+                    firstMesh = GetMesh(firstOperandID);
+                    auto secondMesh = GetMesh(secondOperandID);
+                    origin = GetOrigin(firstMesh, _expressIDToGeometry);
+                    auto normalizeMat = glm::translate(-origin);
+                    auto flatFirstMeshes = flatten(firstMesh, _expressIDToGeometry, normalizeMat);
+                    auto flatSecondMeshes = flatten(secondMesh, _expressIDToGeometry, normalizeMat);
+                    if (flatFirstMeshes.size() == 0) return mesh;
+                    resultMesh = BoolProcess(flatFirstMeshes, flatSecondMeshes, std::string(op), _settings);
+                }
+#else
                 auto firstMesh = GetMesh(firstOperandID);
                 auto secondMesh = GetMesh(secondOperandID);
 
@@ -519,12 +903,11 @@ namespace webifc::geometry
 
                 if (flatFirstMeshes.size() == 0)
                 {
-                    // bail out because we will get strange meshes
-                    // if this happens, probably there's an issue parsing the first mesh
                     return mesh;
                 }
 
                 IfcGeometry resultMesh = BoolProcess(flatFirstMeshes, flatSecondMeshes, std::string(op), _settings);
+#endif
 
                 _expressIDToGeometry[expressID] = resultMesh;
                 mesh.hasGeometry = true;
@@ -725,23 +1108,46 @@ namespace webifc::geometry
                 uint32_t ifcPresentation = _loader.GetRefArgument();
 
                 _expressIDToGeometry[expressID] = GetBrep(ifcPresentation);
+                // A style on the referenced shell applies to the brep geometry;
+                // flag it so the color is not dropped when the flat mesh is assembled
                 if (!mesh.hasColor)
-                    mesh.color = GetStyleItemFromExpressId(ifcPresentation).value_or(glm::dvec4(1.0));
+                {
+                    if (auto shellColor = GetStyleItemFromExpressId(ifcPresentation))
+                    {
+                        mesh.color = *shellColor;
+                        mesh.hasColor = true;
+                    }
+                }
                 mesh.hasGeometry = true;
 
                 return mesh;
             }
             case schema::IFCFACETEDBREP:
+            case schema::IFCFACETEDBREPWITHVOIDS:
             {
                 _loader.MoveToArgumentOffset(expressID, 0);
-                uint32_t ifcPresentation = _loader.GetRefArgument();
-
-                _expressIDToGeometry[expressID] = GetBrep(ifcPresentation);
+                const uint32_t outer = _loader.GetRefArgument();
+                std::vector<uint32_t> voids;
+                if (lineType == schema::IFCFACETEDBREPWITHVOIDS)
+                {
+                    const auto tokens = _loader.GetSetArgument();
+                    for (const auto token : tokens) voids.push_back(_loader.GetRefArgument(token));
+                }
+                IfcGeometry geometry = GetBrep(outer);
+                // Valid void shells are oriented into their cavities. Preserve that
+                // orientation when merging the boundary of the material volume.
+                for (const auto shell : voids) geometry.MergeGeometry(GetBrep(shell));
+                _expressIDToGeometry[expressID] = geometry;
+                // Same as above: honor a style attached to the outer shell
                 if (!mesh.hasColor)
-                    mesh.color = GetStyleItemFromExpressId(ifcPresentation).value_or(glm::dvec4(1.0));
-                ;
+                {
+                    if (auto shellColor = GetStyleItemFromExpressId(outer))
+                    {
+                        mesh.color = *shellColor;
+                        mesh.hasColor = true;
+                    }
+                }
                 mesh.hasGeometry = true;
-
                 return mesh;
             }
             case schema::IFCPRODUCTREPRESENTATION:
@@ -817,53 +1223,11 @@ namespace webifc::geometry
             case schema::IFCFACESURFACE:
             {
                 IfcGeometry geometry;
-                _loader.MoveToArgumentOffset(expressID, 0);
-                auto bounds = _loader.GetSetArgument();
-
-                std::vector<IfcBound3D> bounds3D(bounds.size());
-
-                for (size_t i = 0; i < bounds.size(); i++)
-                {
-                    uint32_t boundID = _loader.GetRefArgument(bounds[i]);
-                    bounds3D[i] = _geometryLoader.GetBound(boundID);
-                }
-
-                TriangulateBounds(geometry, bounds3D, expressID);
-
-                _loader.MoveToArgumentOffset(expressID, 1);
-                auto surfRef = _loader.GetRefArgument();
-
-                auto surface = GetSurface(surfRef);
-
-                if (surface.BSplineSurface.Active)
-                {
-                    // Tessellate unless the face was BOTH retainable and skippable —
-                    // every face must end up in exactly one of the two forms.
-                    if (!RetainBSplineFace(geometry, surface, bounds3D) || !g_skipBSplineTessellation.load())
-                        TriangulateBspline(geometry, bounds3D, surface, _cache.GetLinearScalingFactor());
-                }
-                else if (surface.CylinderSurface.Active)
-                {
-                    TriangulateCylindricalSurface(geometry, bounds3D, surface, _settings._circleSegments);
-                }
-                else if (surface.RevolutionSurface.Active)
-                {
-                    TriangulateRevolution(geometry, bounds3D, surface, _settings._circleSegments);
-                }
-                else if (surface.ExtrusionSurface.Active)
-                {
-                    TriangulateExtrusion(geometry, bounds3D, surface);
-                }
-                else
-                {
-                    TriangulateBounds(geometry, bounds3D, expressID);
-                }
-
+                AddFaceToGeometry(expressID, geometry);
                 _expressIDToGeometry[expressID] = geometry;
                 mesh.expressID = expressID;
                 mesh.hasGeometry = true;
-
-                break;
+                return mesh;
             }
             case schema::IFCTRIANGULATEDIRREGULARNETWORK:
             case schema::IFCTRIANGULATEDFACESET:
@@ -892,12 +1256,18 @@ namespace webifc::geometry
                     // std::cout << "Unsupported IFCTRIANGULATEDFACESET with PnIndex!" << std::endl;
                 }
 
-                for (size_t i = 0; i < indices.size(); i += 3)
+                for (size_t i = 0; i + 2 < indices.size(); i += 3)
                 {
                     int i1 = indices[i + 0] - 1;
                     int i2 = indices[i + 1] - 1;
                     int i3 = indices[i + 2] - 1;
 
+                    if (i1 < 0 || i2 < 0 || i3 < 0 ||
+                        static_cast<size_t>(i1) >= points.size() || static_cast<size_t>(i2) >= points.size() || static_cast<size_t>(i3) >= points.size())
+                    {
+                        spdlog::error("[GetMesh()] Invalid triangulated face index in {}", expressID);
+                        return mesh;
+                    }
                     geom.AddFace(points[i1], points[i2], points[i3]);
                 }
 
@@ -911,9 +1281,7 @@ namespace webifc::geometry
             }
             case schema::IFCSURFACECURVESWEPTAREASOLID:
             {
-
                 // TODO: closed sweeps not implemented
-                // TODO: the plane is not being used now
 
                 _loader.MoveToArgumentOffset(expressID, 0);
 
@@ -925,21 +1293,36 @@ namespace webifc::geometry
                 double startParam = 0;
                 double endParam = 1;
                 auto profileID = _loader.GetRefArgument();
-                auto placementID = _loader.GetRefArgument();
+                // Position is OPTIONAL in IfcSweptAreaSolid, so "$" must be accepted here
+                auto placementID = _loader.GetOptionalRefArgument();
                 auto directrixRef = _loader.GetRefArgument();
                 bool closed = false;
 
-                if (_loader.GetTokenType() == parsing::IfcTokenType::REAL)
-                {
-                    _loader.StepBack();
-                    startParam = _loader.GetDoubleArgument();
-                }
-
-                if (_loader.GetTokenType() == parsing::IfcTokenType::REAL)
-                {
-                    _loader.StepBack();
-                    endParam = _loader.GetDoubleArgument();
-                }
+                // IFC4 uses optional numbers; IFC4X3 uses IfcCurveMeasureSelect.
+                // Consume the complete typed value, including its closing parenthesis.
+                auto readParam = [&](double defaultValue) {
+                    auto token = _loader.GetTokenType();
+                    if (token == parsing::IfcTokenType::REAL || token == parsing::IfcTokenType::INTEGER)
+                    {
+                        _loader.StepBack();
+                        return _loader.GetDoubleArgument();
+                    }
+                    if (token == parsing::IfcTokenType::LABEL)
+                    {
+                        _loader.StepBack();
+                        auto label = _loader.GetStringArgument();
+                        if ((label == "IFCPARAMETERVALUE" || label == "IFCLENGTHMEASURE") &&
+                            _loader.GetTokenType() == parsing::IfcTokenType::SET_BEGIN)
+                        {
+                            double value = _loader.GetOptionalDoubleParam(defaultValue);
+                            _loader.GetTokenType(); // SET_END of the typed value
+                            return value;
+                        }
+                    }
+                    return defaultValue;
+                };
+                startParam = readParam(startParam);
+                endParam = readParam(endParam);
 
                 auto surfaceID = _loader.GetRefArgument();
 
@@ -982,8 +1365,14 @@ namespace webifc::geometry
                 }
 
                 std::reverse(profile.curve.points.begin(), profile.curve.points.end());
+                // Holes must keep the opposite winding to the outer ring
+                for (auto &hole : profile.holes)
+                {
+                    hole.Invert();
+                }
 
-                IfcGeometry geom = Sweep(_cache.GetLinearScalingFactor(), closed, profile, directrix, surface.normal(), true);
+                // IFC: Axis1 = reference surface normal at the directrix start, Axis3 = directrix tangent, Axis2 = Axis3 x Axis1
+                IfcGeometry geom = Sweep(_cache.GetLinearScalingFactor(), closed, profile, directrix, surface.normalAt(directrix.points[0]), true);
 
                 mesh.transformation = placement;
                 _expressIDToGeometry[expressID] = geom;
@@ -998,16 +1387,33 @@ namespace webifc::geometry
                 uint32_t profileID = _loader.GetRefArgument();
                 uint32_t placementID = _loader.GetOptionalRefArgument();
                 uint32_t directrixRef = _loader.GetRefArgument();
+                // StartParam and EndParam precede FixedReference (also in IFC4X3).
+                auto skipParam = [&]() {
+                    auto token = _loader.GetTokenType();
+                    if (token == parsing::IfcTokenType::REAL || token == parsing::IfcTokenType::INTEGER)
+                    {
+                        _loader.StepBack();
+                        _loader.GetDoubleArgument();
+                    }
+                    else if (token == parsing::IfcTokenType::LABEL)
+                    {
+                        _loader.StepBack();
+                        _loader.GetStringArgument();
+                        _loader.GetSetArgument();
+                    }
+                };
+                skipParam();
+                skipParam();
                 uint32_t fixedReferenceID = _loader.GetRefArgument();
 
                 // Retrieve profile, placement, directrix, and fixed reference direction
                 IfcProfile profile = _geometryLoader.GetProfile(profileID);
                 glm::dmat4 placement = placementID ? _geometryLoader.GetLocalPlacement(placementID) : glm::dmat4(1.0);
                 IfcCurve directrix = _geometryLoader.GetCurve(directrixRef, 3);
-                glm::dvec3 fixedReference = _geometryLoader.GetCartesianPoint3D(fixedReferenceID);
+                glm::dvec3 fixedReference = _geometryLoader.GetDirection(fixedReferenceID);
 
                 // Check for valid profile and directrix
-                if (profile.curve.points.empty() || directrix.points.empty()) {
+                if (profile.curve.points.empty() || directrix.points.size() < 2) {
                     spdlog::error("[GetMesh()] Invalid profile or directrix for IFCFIXEDREFERENCESWEPTAREASOLID {}", expressID);
                     return mesh;
                 }
@@ -1041,36 +1447,34 @@ namespace webifc::geometry
                 auto directrixRef = _loader.GetRefArgument();
 
                 double radius = _loader.GetDoubleArgument();
-                // double innerRadius = 0.0;
-
-                if (_loader.GetTokenType() == parsing::IfcTokenType::REAL)
-                {
-                    spdlog::error("[GetMesh()] Inner radius of IFCSWEPTDISKSOLID currently not supported {}", expressID);
-                    _loader.StepBack();
-                    _loader.GetDoubleArgument();
-                }
-
-                // double startParam = 0;
-                // double endParam = 0;
+                double innerRadius = 0.0;
 
                 if (_loader.GetTokenType() == parsing::IfcTokenType::REAL)
                 {
                     _loader.StepBack();
-                    _loader.GetDoubleArgument();
+                    innerRadius = _loader.GetDoubleArgument();
                 }
 
+                std::optional<double> startParam, endParam;
                 if (_loader.GetTokenType() == parsing::IfcTokenType::REAL)
                 {
                     _loader.StepBack();
-                    _loader.GetDoubleArgument();
+                    startParam = _loader.GetDoubleArgument();
+                }
+                if (_loader.GetTokenType() == parsing::IfcTokenType::REAL)
+                {
+                    _loader.StepBack();
+                    endParam = _loader.GetDoubleArgument();
                 }
 
-                IfcCurve directrix = _geometryLoader.GetCurve(directrixRef, 3);
+                IfcCurve directrix = _geometryLoader.GetCurveWithParameters(directrixRef, 3, startParam, endParam);
+                if (directrix.points.size() < 2) return mesh;
+                closed = directrix.points.size() > 2 && glm::distance(directrix.points.front(), directrix.points.back()) < EPS_SMALL;
 
                 IfcProfile profile;
                 profile.curve = GetCircleCurve(radius, _settings._circleSegments);
 
-                IfcGeometry geom = SweepCircular(_cache.GetLinearScalingFactor(), closed, profile, radius, directrix);
+                IfcGeometry geom = SweepCircular(_cache.GetLinearScalingFactor(), closed, profile, radius, directrix, glm::dvec3(0), false, innerRadius);
 
                 geom.sweptDiskSolid.axis = std::vector<IfcCurve>{directrix};
                 geom.sweptDiskSolid.profiles = std::vector<IfcProfile>{profile};
@@ -1084,43 +1488,20 @@ namespace webifc::geometry
             }
             case schema::IFCREVOLVEDAREASOLID:
             {
-                IfcComposedMesh mesh;
-
                 _loader.MoveToArgumentOffset(expressID, 0);
                 uint32_t profileID = _loader.GetRefArgument();
-                uint32_t placementID = _loader.GetRefArgument();
+                uint32_t placementID = _loader.GetOptionalRefArgument();
                 uint32_t axis1PlacementID = _loader.GetRefArgument();
-                double angle = angleConversion(_loader.GetDoubleArgument(), _cache.GetAngleUnits());
+                double angle = _loader.GetDoubleArgument() * _cache.GetAngularScalingFactor();
+                // Compatibility with exporters using DEGREE in IfcSIUnit, which is not an IFC SI unit name.
+                if (_cache.GetAngleUnits() == "DEGREE") angle = angleConversion(angle, "DEGREE");
 
                 IfcProfile profile = _geometryLoader.GetProfile(profileID);
-                glm::dmat4 placement = _geometryLoader.GetLocalPlacement(placementID);
+                glm::dmat4 placement = placementID ? _geometryLoader.GetLocalPlacement(placementID) : glm::dmat4(1);
                 glm::dvec3 axis = _geometryLoader.GetAxis1Placement(axis1PlacementID)[0];
 
-                bool closed = false;
-
                 glm::dvec3 pos = _geometryLoader.GetAxis1Placement(axis1PlacementID)[1];
-
-                IfcCurve directrix = BuildArc(_cache.GetLinearScalingFactor(), pos, axis, angle, _settings._circleSegments);
-                if (glm::distance(directrix.points[0], directrix.points[directrix.points.size() - 1]) < EPS_BIG)
-                {
-                    closed = true;
-                }
-
-                IfcGeometry geom;
-
-                if (!profile.isComposite)
-                {
-                    geom = Sweep(_cache.GetLinearScalingFactor(), closed, profile, directrix, axis, false);
-                }
-                else
-                {
-                    for (uint32_t i = 0; i < profile.profiles.size(); i++)
-                    {
-                        IfcGeometry geom_t = Sweep(_cache.GetLinearScalingFactor(), closed, profile.profiles[i], directrix, axis, false, false);
-                        geom.AddPart(geom_t);
-                        geom.AddGeometry(geom_t);
-                    }
-                }
+                IfcGeometry geom = RevolveProfile(profile, axis, pos, angle, _settings._circleSegments);
 
                 mesh.transformation = placement;
                 _expressIDToGeometry[expressID] = geom;
@@ -1140,6 +1521,8 @@ namespace webifc::geometry
                 uint32_t placementID = _loader.GetOptionalRefArgument();
                 uint32_t directionID = _loader.GetRefArgument();
                 double depth = _loader.GetDoubleArgument();
+                const bool tapered = _loader.GetLineType(expressID) == schema::IFCEXTRUDEDAREASOLIDTAPERED;
+                const uint32_t endProfileID = tapered ? _loader.GetRefArgument() : 0;
 
                 auto lineProfileType = _loader.GetLineType(profileID);
                 IfcProfile profile = _geometryLoader.GetProfile(profileID);
@@ -1166,7 +1549,7 @@ namespace webifc::geometry
                     mesh.transformation = _geometryLoader.GetLocalPlacement(placementID);
                 }
 
-                glm::dvec3 dir = _geometryLoader.GetCartesianPoint3D(directionID);
+                glm::dvec3 dir = _geometryLoader.GetDirection(directionID);
 
                 double dirDot = glm::dot(dir, glm::dvec3(0, 0, 1));
                 bool flipWinding = dirDot < 0; // can't be perp according to spec
@@ -1178,7 +1561,11 @@ namespace webifc::geometry
 
                 IfcGeometry geom;
 
-                if (!profile.isComposite)
+                if (tapered)
+                {
+                    geom = ExtrudeTapered(profile, _geometryLoader.GetProfile(endProfileID), dir, depth);
+                }
+                else if (!profile.isComposite)
                 {
                     geom = Extrude(profile, dir, depth);
                     if (flipWinding)
@@ -1234,6 +1621,67 @@ namespace webifc::geometry
                 mesh.expressID = expressID;
                 mesh.hasGeometry = true;
 
+                return mesh;
+            }
+            case schema::IFCCSGSOLID:
+            {
+                _loader.MoveToArgumentOffset(expressID, 0);
+                mesh.children.push_back(GetMesh(_loader.GetRefArgument()));
+                return mesh;
+            }
+            case schema::IFCBLOCK:
+            case schema::IFCRECTANGULARPYRAMID:
+            case schema::IFCRIGHTCIRCULARCONE:
+            {
+                _loader.MoveToArgumentOffset(expressID, 0);
+                const uint32_t placementID = _loader.GetRefArgument();
+                const double x = _loader.GetDoubleArgument();
+                const double y = _loader.GetDoubleArgument();
+                IfcGeometry geom;
+                if (lineType == schema::IFCRIGHTCIRCULARCONE)
+                {
+                    const double height = x, radius = y;
+                    if (height <= 0 || radius <= 0) return mesh;
+                    const size_t segments = std::max<uint32_t>(12, _settings._circleSegments);
+                    const glm::dvec3 apex(0, 0, height), center(0);
+                    for (size_t i = 0; i < segments; ++i)
+                    {
+                        const double a = 2 * CONST_PI * i / segments;
+                        const double b = 2 * CONST_PI * ((i + 1) % segments) / segments;
+                        const glm::dvec3 p(radius * std::cos(a), radius * std::sin(a), 0);
+                        const glm::dvec3 q(radius * std::cos(b), radius * std::sin(b), 0);
+                        geom.AddFace(p, q, apex);
+                        geom.AddFace(center, q, p);
+                    }
+                }
+                else
+                {
+                    const double height = _loader.GetDoubleArgument();
+                    if (x <= 0 || y <= 0 || height <= 0) return mesh;
+                    if (lineType == schema::IFCBLOCK)
+                    {
+                        IfcProfile profile;
+                        profile.isConvex = true;
+                        // Unlike a centred profile, a block starts at the placement origin.
+                        profile.curve = GetRectangleCurve(x, y);
+                        for (auto& p : profile.curve.points) p += glm::dvec3(x / 2, y / 2, 0);
+                        geom = Extrude(profile, glm::dvec3(0, 0, 1), height);
+                    }
+                    else
+                    {
+                        const std::vector<glm::dvec3> ring = {
+                            {-x / 2, -y / 2, 0}, {x / 2, -y / 2, 0},
+                            {x / 2, y / 2, 0}, {-x / 2, y / 2, 0}};
+                        const glm::dvec3 apex(0, 0, height);
+                        for (size_t i = 0; i < ring.size(); ++i)
+                            geom.AddFace(ring[i], ring[(i + 1) % ring.size()], apex);
+                        geom.AddFace(ring[0], ring[2], ring[1]);
+                        geom.AddFace(ring[0], ring[3], ring[2]);
+                    }
+                }
+                mesh.transformation = _geometryLoader.GetLocalPlacement(placementID);
+                _expressIDToGeometry[expressID] = geom;
+                mesh.hasGeometry = true;
                 return mesh;
             }
             case schema::IFCRIGHTCIRCULARCYLINDER:
@@ -1332,109 +1780,38 @@ namespace webifc::geometry
             }
             case schema::IFCSPHERE:
             {
-                // IfcSphere is a CSG solid primitive: center + radius
-                // Arguments:
-                // 0: Position (IfcAxis2Placement3D) - defines center and local orientation
-                // 1: Radius
-
                 _loader.MoveToArgumentOffset(expressID, 0);
-                uint32_t placementID = _loader.GetRefArgument();
-                double radius = _loader.GetDoubleArgument();
-
-                // Get the placement matrix (center at [3], orientation in columns 0-2)
-                glm::dmat4 placement = _geometryLoader.GetLocalPlacement(placementID);
-
-                glm::dvec3 center = glm::dvec3(placement[3]);
-                glm::dvec3 xAxis = glm::normalize(glm::dvec3(placement[0]));
-                glm::dvec3 yAxis = glm::normalize(glm::dvec3(placement[1]));
-                glm::dvec3 zAxis = glm::normalize(glm::dvec3(placement[2]));
-
-                // Tessellate sphere using latitude/longitude grid
-                // Use circleSegments for azimuthal (longitude) resolution
-                // Use half that for latitudinal resolution (reasonable quality)
-                uint32_t azimuthSegments = _settings._circleSegments;
-                uint32_t altitudeSegments = _settings._circleSegments / 2;
-                if (altitudeSegments < 4) altitudeSegments = 4; // minimum for decent sphere
-
+                const uint32_t placementID = _loader.GetRefArgument();
+                const double radius = _loader.GetDoubleArgument();
+                if (radius <= 0) return mesh;
+                const uint32_t azimuth = std::max<uint32_t>(12, _settings._circleSegments);
+                const uint32_t altitude = std::max<uint32_t>(4, azimuth / 2);
                 IfcGeometry geom;
-
-                // Generate vertices (position + dummy normal for consistency with other cases)
-                std::vector<glm::dvec3> vertices;
-                vertices.reserve((altitudeSegments + 1) * (azimuthSegments + 1));
-
-                for (uint32_t lat = 0; lat <= altitudeSegments; ++lat)
-                {
-                    double theta = glm::pi<double>() * lat / altitudeSegments; // 0 (north pole) to pi (south pole)
-                    double sinTheta = std::sin(theta);
-                    double cosTheta = std::cos(theta);
-
-                    for (uint32_t lon = 0; lon <= azimuthSegments; ++lon)
+                auto point = [&](uint32_t lat, uint32_t lon) {
+                    if (lat == 0) return glm::dvec3(0, 0, radius);
+                    if (lat == altitude) return glm::dvec3(0, 0, -radius);
+                    const double theta = glm::pi<double>() * lat / altitude;
+                    const double phi = 2 * glm::pi<double>() * (lon % azimuth) / azimuth;
+                    return radius * glm::dvec3(std::sin(theta) * std::cos(phi),
+                                              std::sin(theta) * std::sin(phi), std::cos(theta));
+                };
+                auto face = [&](glm::dvec3 a, glm::dvec3 b, glm::dvec3 c) {
+                    if (glm::dot(glm::cross(b - a, c - a), a + b + c) < 0) std::swap(b, c);
+                    const uint32_t start = geom.numPoints;
+                    for (const auto p : {a, b, c}) geom.AddPoint(p, p / radius);
+                    geom.AddFace(start, start + 1, start + 2);
+                };
+                for (uint32_t lat = 0; lat < altitude; ++lat)
+                    for (uint32_t lon = 0; lon < azimuth; ++lon)
                     {
-                        double phi = 2.0 * glm::pi<double>() * lon / azimuthSegments;
-                        double sinPhi = std::sin(phi);
-                        double cosPhi = std::cos(phi);
-
-                        // Spherical coordinates to Cartesian (in local space)
-                        glm::dvec3 localPos(
-                            radius * sinTheta * cosPhi,
-                            radius * sinTheta * sinPhi,
-                            radius * cosTheta
-                        );
-
-                        // Transform to world space using placement axes
-                        glm::dvec3 pos = center + localPos.x * xAxis + localPos.y * yAxis + localPos.z * zAxis;
-
-                        vertices.push_back(pos);
+                        const auto a = point(lat, lon), b = point(lat, lon + 1);
+                        const auto c = point(lat + 1, lon), d = point(lat + 1, lon + 1);
+                        if (lat != 0) face(a, b, c);
+                        if (lat + 1 != altitude) face(b, d, c);
                     }
-                }
-
-                // Build vertex buffer (6 floats per vertex: pos + dummy normal)
-                for (const auto& v : vertices)
-                {
-                    geom.vertexData.push_back(v.x);
-                    geom.vertexData.push_back(v.y);
-                    geom.vertexData.push_back(v.z);
-                    geom.vertexData.push_back(0.0); // dummy normal X
-                    geom.vertexData.push_back(0.0); // dummy normal Y
-                    geom.vertexData.push_back(1.0); // dummy normal Z
-                }
-
-                // Generate triangle indices (quads -> two triangles, poles handled correctly)
-                uint32_t vertsPerRing = azimuthSegments + 1;
-                for (uint32_t lat = 0; lat < altitudeSegments; ++lat)
-                {
-                    uint32_t bottom = lat * vertsPerRing;
-                    uint32_t top = bottom + vertsPerRing;
-
-                    for (uint32_t lon = 0; lon < azimuthSegments; ++lon)
-                    {
-                        uint32_t bl = bottom + lon;     // bottom-left
-                        uint32_t br = bottom + lon + 1; // bottom-right
-                        uint32_t tl = top + lon;        // top-left
-                        uint32_t tr = top + lon + 1;    // top-right
-
-                        // First triangle
-                        geom.indexData.push_back(bl);
-                        geom.indexData.push_back(br);
-                        geom.indexData.push_back(tl);
-
-                        // Second triangle
-                        geom.indexData.push_back(br);
-                        geom.indexData.push_back(tr);
-                        geom.indexData.push_back(tl);
-                    }
-                }
-
-                geom.numFaces = geom.indexData.size() / 3;
-                geom.numPoints = static_cast<uint32_t>(vertices.size());
-                geom.isPolygon = false;
-                geom.buildPlanes();
-
                 _expressIDToGeometry[expressID] = geom;
                 mesh.hasGeometry = true;
-                mesh.expressID = expressID;
-                mesh.transformation = placement; // apply the sphere's placement
-                
+                mesh.transformation = _geometryLoader.GetLocalPlacement(placementID);
                 return mesh;
             }
             case schema::IFCCIRCLE:
@@ -1443,6 +1820,10 @@ namespace webifc::geometry
             case schema::IFCINDEXEDPOLYCURVE:
             case schema::IFCTRIMMEDCURVE:
             case schema::IFCGRADIENTCURVE:
+            case schema::IFCCURVESEGMENT:
+            case schema::IFCCLOTHOID:
+            case schema::IFCLINE:
+            case schema::IFCSEGMENTEDREFERENCECURVE:
             {
                 auto lineProfileType = _loader.GetLineType(expressID);
                 IfcCurve curve = _geometryLoader.GetCurve(expressID, 3, false);
@@ -1839,9 +2220,18 @@ namespace webifc::geometry
             uint32_t profileID = _loader.GetRefArgument();
             IfcProfile profile = _geometryLoader.GetProfile(profileID);
 
+            // The swept curve's direction sets the sign of the surface normal, but GetProfile normalizes open
+            // profiles to CCW (reversing them), so the directrix is read again in its original direction.
+            IfcCurve sweptCurve = profile.curve;
+            if (_loader.GetLineType(profileID) == schema::IFCARBITRARYOPENPROFILEDEF)
+            {
+                _loader.MoveToArgumentOffset(profileID, 2);
+                sweptCurve = _geometryLoader.GetCurve(_loader.GetRefArgument(), 3);
+            }
+
             _loader.MoveToArgumentOffset(expressID, 2);
             uint32_t directionID = _loader.GetRefArgument();
-            glm::dvec3 direction = _geometryLoader.GetCartesianPoint3D(directionID);
+            glm::dvec3 direction = _geometryLoader.GetDirection(directionID);
 
             _loader.MoveToArgumentOffset(expressID, 3);
             double length = 0;
@@ -1854,6 +2244,7 @@ namespace webifc::geometry
             surface.ExtrusionSurface.Active = true;
             surface.ExtrusionSurface.Length = length;
             surface.ExtrusionSurface.Profile = profile;
+            surface.ExtrusionSurface.SweptCurve = sweptCurve;
             surface.ExtrusionSurface.Direction = direction;
 
             _loader.MoveToArgumentOffset(expressID, 1);
@@ -1924,7 +2315,14 @@ namespace webifc::geometry
             if (!_isCoordinated && _settings._coordinateToOrigin)
             {
                 auto &geom = _expressIDToGeometry[composedMesh.expressID];
-                if (geom.numPoints > 0)
+                auto skipped = _skippedItems ? _skippedItems->find(composedMesh.expressID) : decltype(_skippedItems->end()){};
+                if (_skippedItems && skipped != _skippedItems->end() && geom.numPoints == 0)
+                {
+                    auto transformedPt = newMatrix * glm::dvec4(skipped->second, 1);
+                    _coordinationMatrix = glm::translate(-glm::dvec3(transformedPt));
+                    _isCoordinated = true;
+                }
+                else if (geom.numPoints > 0)
                 {
                     auto pt = geom.GetPoint(0);
                     auto transformedPt = newMatrix * glm::dvec4(pt, 1);
@@ -1941,6 +2339,14 @@ namespace webifc::geometry
                     return; // only triangles
                 }
             }
+            // BUGFIX: testReverse() inspects geometry.transformation's handedness, but
+            // that member was still uninitialized here (it was only assigned further
+            // below), so the reverse decision read garbage stack memory — deterministic
+            // per build but different across builds/execution paths, silently flipping
+            // the winding of arbitrary elements and persisting it to the cache. Set the
+            // transformation (coordination + placement; the later Normalize adds only a
+            // translation, det +1, so it can't change handedness) before testing.
+            geometry.transformation = _coordinationMatrix * newMatrix;
             if (geometry.testReverse())
                 geom.ReverseFaces();
 
@@ -1961,6 +2367,7 @@ namespace webifc::geometry
                 newParentColor = composedMesh.color;
                 newHasColor = composedMesh.hasColor;
             }
+            geometry.hasColor = newHasColor;
 
             geometry.transformation = _coordinationMatrix * newMatrix * translation;
 
@@ -2164,6 +2571,7 @@ namespace webifc::geometry
             TriangulateBounds(geometry, bounds3D, expressID);
             break;
         }
+        case schema::IFCFACESURFACE:
         case schema::IFCADVANCEDFACE:
         {
             _loader.MoveToArgumentOffset(expressID, 0);
@@ -2180,36 +2588,63 @@ namespace webifc::geometry
             _loader.MoveToArgumentOffset(expressID, 1);
             auto surfRef = _loader.GetRefArgument();
 
+            _loader.MoveToArgumentOffset(expressID, 2);
+            const bool sameSense = _loader.GetStringArgument() == "T";
             auto surface = GetSurface(surfRef);
+            IfcGeometry faceGeometry;
 
             // TODO: place the face in the surface and tringulate
 
             if (surface.BSplineSurface.Active)
             {
-                // gvcs-ifc: retain the parametric surface. THIS is the path an
-                // IfcAdvancedBrep takes (IFCCLOSEDSHELL -> AddFaceToGeometry),
-                // and it writes into the SHARED brep geometry by reference — so
-                // no merge propagation is needed here.
+                // gvcs-ifc: retain the parametric surface. Since 0.79 EVERY
+                // surface face comes through here — a shell's IfcAdvancedFace /
+                // IfcFaceSurface (IFCCLOSEDSHELL -> AddFaceToGeometry) and a
+                // standalone IfcFaceSurface (GetMesh -> AddFaceToGeometry).
+                // RETAIN into the caller's `geometry`, which outlives this call;
+                // TESSELLATE into the scratch `faceGeometry`, whose triangles the
+                // SameSense loop below copies out. Retaining into `faceGeometry`
+                // would drop the face silently (see RetainBSplineFace).
                 // Tessellate unless the face was BOTH retainable and skippable —
                 // every face must end up in exactly one of the two forms.
-                if (!RetainBSplineFace(geometry, surface, bounds3D) || !g_skipBSplineTessellation.load())
-                    TriangulateBspline(geometry, bounds3D, surface, _cache.GetLinearScalingFactor());
+                if (!RetainBSplineFace(geometry, surface, bounds3D, sameSense) || !g_skipBSplineTessellation.load())
+                    TriangulateBspline(faceGeometry, bounds3D, surface, _cache.GetLinearScalingFactor());
             }
             else if (surface.CylinderSurface.Active)
             {
-                TriangulateCylindricalSurface(geometry, bounds3D, surface, _settings._circleSegments);
+                TriangulateCylindricalSurface(faceGeometry, bounds3D, surface, _settings._circleSegments);
             }
             else if (surface.RevolutionSurface.Active)
             {
-                TriangulateRevolution(geometry, bounds3D, surface, _settings._circleSegments);
+                TriangulateRevolution(faceGeometry, bounds3D, surface, _settings._circleSegments);
             }
             else if (surface.ExtrusionSurface.Active)
             {
-                TriangulateExtrusion(geometry, bounds3D, surface);
+                TriangulateExtrusion(faceGeometry, bounds3D, surface);
             }
             else
             {
-                TriangulateBounds(geometry, bounds3D, expressID);
+                TriangulateBounds(faceGeometry, bounds3D, expressID);
+            }
+            // Bound orientation describes the loops. SameSense describes the face
+            // relative to its underlying surface, independently of those loops.
+            for (uint32_t i = 0; i < faceGeometry.numFaces; ++i)
+            {
+                const auto f = faceGeometry.GetFace(i);
+                auto a = faceGeometry.GetPoint(f.i0), b = faceGeometry.GetPoint(f.i1), c = faceGeometry.GetPoint(f.i2);
+                glm::dvec3 surfaceNormal(0);
+                if (_loader.GetLineType(surfRef) == schema::IFCPLANE)
+                    surfaceNormal = glm::dvec3(surface.transformation[2]);
+                else if (surface.CylinderSurface.Active)
+                {
+                    const auto axis = glm::normalize(glm::dvec3(surface.transformation[2]));
+                    const auto radial = (a + b + c) / 3.0 - glm::dvec3(surface.transformation[3]);
+                    surfaceNormal = radial - axis * glm::dot(radial, axis);
+                }
+                if (glm::dot(glm::cross(b - a, c - a), surfaceNormal) < 0) std::swap(b, c);
+                if (!sameSense) std::swap(b, c);
+                // Rebuild normals together with triangle winding.
+                geometry.AddFace(a, b, c);
             }
             break;
         }
@@ -2262,8 +2697,250 @@ namespace webifc::geometry
         return newGeom;
     }
 
+    // For a closed mesh the face area vectors cancel out and the first moments sum(area vector *
+    // centroid^T) equal the volume times the identity; both hold with T-junctions too. Checking the
+    // moments as well catches open meshes whose holes cancel in area, such as a tube without caps.
+    static bool IsClosed(const IfcGeometry &geometry)
+    {
+        if (geometry.numFaces == 0 || geometry.numPoints == 0) return false;
+        glm::dvec3 origin(0);
+        for (uint32_t i = 0; i < geometry.numPoints; i++) origin += geometry.GetPoint(i);
+        origin /= (double)geometry.numPoints;
+        glm::dvec3 areaSum(0);
+        glm::dmat3 moments(0);
+        double areaScale = 0, momentScale = 0;
+        for (uint32_t i = 0; i < geometry.numFaces; i++)
+        {
+            bimGeometry::Face f = geometry.GetFace(i);
+            glm::dvec3 a = geometry.GetPoint(f.i0) - origin, b = geometry.GetPoint(f.i1) - origin, c = geometry.GetPoint(f.i2) - origin;
+            glm::dvec3 area = glm::cross(b - a, c - a) * 0.5;
+            glm::dvec3 centroid = (a + b + c) / 3.0;
+            areaSum += area;
+            moments += glm::outerProduct(area, centroid);
+            areaScale += glm::length(area);
+            momentScale += glm::length(area) * glm::length(centroid);
+        }
+        if (!std::isfinite(momentScale) || areaScale <= 0) return false;
+        if (glm::length(areaSum) > 1e-6 * areaScale) return false;
+        double volume = (moments[0][0] + moments[1][1] + moments[2][2]) / 3.0;
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++)
+                if (std::abs(moments[c][r] - (r == c ? volume : 0.0)) > 1e-6 * momentScale) return false;
+        return true;
+    }
+
+    // Solve for the point closest to q that lies on all given planes (at most three,
+    // pairwise non-parallel). Returns false when the planes are nearly dependent.
+    static bool ClosestPointOnPlanes(const glm::dvec3 &q, const std::vector<const bimGeometry::Plane *> &planes, glm::dvec3 &result)
+    {
+        size_t k = planes.size();
+        double m[3][4] = {};
+        for (size_t i = 0; i < k; i++)
+        {
+            for (size_t j = 0; j < k; j++) m[i][j] = glm::dot(planes[i]->normal, planes[j]->normal);
+            m[i][3] = glm::dot(planes[i]->normal, q) - planes[i]->distance;
+        }
+        for (size_t c = 0; c < k; c++)
+        {
+            size_t pivot = c;
+            for (size_t r = c + 1; r < k; r++) if (std::abs(m[r][c]) > std::abs(m[pivot][c])) pivot = r;
+            // Pivots shrink with the squared sine of the angle between normals.
+            if (std::abs(m[pivot][c]) < 1e-6) return false;
+            for (size_t j = 0; j < 4; j++) std::swap(m[c][j], m[pivot][j]);
+            for (size_t r = 0; r < k; r++)
+            {
+                if (r == c) continue;
+                double f = m[r][c] / m[c][c];
+                for (size_t j = c; j < 4; j++) m[r][j] -= f * m[c][j];
+            }
+        }
+        result = q;
+        for (size_t i = 0; i < k; i++) result -= planes[i]->normal * (m[i][3] / m[i][i]);
+        return true;
+    }
+
+    // A cutter face lying within a few tolerances of a parallel face of the operand straddles the
+    // kernel's coplanarity tolerance: some of its vertices count as on the operand's plane, others
+    // as off it, and the difference comes out open, keeps a capped skin or skips the cut (an opening
+    // placed a tenth of a millimetre off a wall face and tilted by 1e-5 rad, for example). Such faces
+    // are moved exactly onto the operand's plane before the difference. Positions are welded first so
+    // that every copy of a vertex moves together, and a vertex shared by faces snapped to several
+    // planes goes to the closest point on all of them. Returns false, leaving snapped untouched, when
+    // no face needs to move or the cutter is not a closed solid.
+    static bool SnapToOperandPlanes(const IfcGeometry &operand, const IfcGeometry &cutter, double snapDistance, IfcGeometry &snapped)
+    {
+        if (cutter.numFaces == 0 || operand.planes.empty()) return false;
+
+        glm::dvec3 lo(std::numeric_limits<double>::max()), hi(std::numeric_limits<double>::lowest());
+        for (uint32_t i = 0; i < cutter.numPoints; i++)
+        {
+            glm::dvec3 q = cutter.GetPoint(i);
+            lo = glm::min(lo, q);
+            hi = glm::max(hi, q);
+        }
+
+        // Only planes that carry operand faces and pass through the cutter's bounds.
+        std::vector<const bimGeometry::Plane *> candidates;
+        std::vector<bool> seen(operand.planes.size(), false);
+        for (uint32_t i = 0; i < operand.numFaces; i++)
+        {
+            uint32_t id = operand.planeData[i];
+            if (id >= operand.planes.size() || seen[id]) continue;
+            seen[id] = true;
+            const bimGeometry::Plane &plane = operand.planes[id];
+            if (!std::isfinite(plane.distance) || !std::isfinite(plane.normal.x) || !std::isfinite(plane.normal.y) || !std::isfinite(plane.normal.z)) continue;
+            if (std::abs(glm::length(plane.normal) - 1.0) > EPS_SMALL) continue;
+            double dmin = std::numeric_limits<double>::max(), dmax = std::numeric_limits<double>::lowest();
+            for (int c = 0; c < 8; c++)
+            {
+                glm::dvec3 corner(c & 1 ? hi.x : lo.x, c & 2 ? hi.y : lo.y, c & 4 ? hi.z : lo.z);
+                double d = glm::dot(plane.normal, corner) - plane.distance;
+                dmin = std::min(dmin, d);
+                dmax = std::max(dmax, d);
+            }
+            if (dmin <= snapDistance && dmax >= -snapDistance) candidates.push_back(&plane);
+        }
+        if (candidates.empty()) return false;
+
+        // Nearest parallel operand plane within the snap distance for each cutter face. When several lie
+        // within reach at different offsets (a sliver of the operand thinner than the snap distance), the
+        // face is left alone: which side it belongs to is not decidable at this tolerance.
+        std::vector<std::pair<uint32_t, const bimGeometry::Plane *>> snappedFaces;
+        for (uint32_t i = 0; i < cutter.numFaces; i++)
+        {
+            bimGeometry::Face f = cutter.GetFace(i);
+            glm::dvec3 p[3] = {cutter.GetPoint(f.i0), cutter.GetPoint(f.i1), cutter.GetPoint(f.i2)};
+            glm::dvec3 n;
+            if (!computeSafeNormal(p[0], p[1], p[2], n, EPS_SMALL)) continue;
+            const bimGeometry::Plane *best = nullptr;
+            double bestDistance = snapDistance, bestOffset = 0;
+            bool ambiguous = false;
+            glm::dvec3 centre = (p[0] + p[1] + p[2]) / 3.0;
+            for (const bimGeometry::Plane *plane : candidates)
+            {
+                double cosine = glm::dot(plane->normal, n);
+                if (std::abs(cosine) < bimGeometry::COPLANAR_MIN_COS) continue;
+                double d = 0;
+                for (const glm::dvec3 &q : p) d = std::max(d, std::abs(glm::dot(plane->normal, q) - plane->distance));
+                if (d > snapDistance) continue;
+                double offset = (glm::dot(plane->normal, centre) - plane->distance) * (cosine > 0 ? 1.0 : -1.0);
+                if (best && std::abs(offset - bestOffset) > bimGeometry::SNAP_WELD_DISTANCE) ambiguous = true;
+                if (!best || d < bestDistance) { bestDistance = d; best = plane; bestOffset = offset; }
+            }
+            if (!best || ambiguous) continue;
+            snappedFaces.push_back({i, best});
+        }
+        // Even faces already within rounding of the plane are snapped: the kernel's result depends on
+        // sub-1e-9 offsets there too.
+        if (snappedFaces.empty()) return false;
+
+        // Inside and outside are undefined for an open cutter; moving its faces would only change
+        // which wrong result the kernel produces.
+        if (!IsClosed(cutter)) return false;
+
+        // Weld positions closer than the weld distance: sweep the points in x order, comparing each
+        // with the earlier ones whose x lies within that distance.
+        std::vector<glm::dvec3> positions;
+        std::vector<uint32_t> positionOf(cutter.numPoints);
+        {
+            std::vector<uint32_t> order(cutter.numPoints);
+            for (uint32_t i = 0; i < cutter.numPoints; i++) order[i] = i;
+            std::sort(order.begin(), order.end(), [&](uint32_t l, uint32_t r) { return cutter.GetPoint(l).x < cutter.GetPoint(r).x; });
+            for (size_t k = 0; k < order.size(); k++)
+            {
+                glm::dvec3 q = cutter.GetPoint(order[k]);
+                int64_t found = -1;
+                for (size_t j = k; j-- > 0;)
+                {
+                    glm::dvec3 other = cutter.GetPoint(order[j]);
+                    if (q.x - other.x > bimGeometry::SNAP_WELD_DISTANCE) break;
+                    if (glm::distance(other, q) <= bimGeometry::SNAP_WELD_DISTANCE) { found = positionOf[order[j]]; break; }
+                }
+                if (found < 0)
+                {
+                    found = (int64_t)positions.size();
+                    positions.push_back(q);
+                }
+                positionOf[order[k]] = (uint32_t)found;
+            }
+        }
+
+        std::vector<std::vector<const bimGeometry::Plane *>> constraints(positions.size());
+        for (auto [i, plane] : snappedFaces)
+        {
+            bimGeometry::Face f = cutter.GetFace(i);
+            for (uint32_t x : {positionOf[f.i0], positionOf[f.i1], positionOf[f.i2]})
+            {
+                auto &c = constraints[x];
+                if (std::find(c.begin(), c.end(), plane) == c.end()) c.push_back(plane);
+            }
+        }
+
+        std::vector<glm::dvec3> moved(positions);
+        for (size_t x = 0; x < positions.size(); x++)
+        {
+            auto &c = constraints[x];
+            if (c.empty()) continue;
+            // Nearest plane first; parallel planes after the first are dropped.
+            std::sort(c.begin(), c.end(), [&](const bimGeometry::Plane *l, const bimGeometry::Plane *r) {
+                return std::abs(glm::dot(l->normal, positions[x]) - l->distance) < std::abs(glm::dot(r->normal, positions[x]) - r->distance);
+            });
+            std::vector<const bimGeometry::Plane *> independent;
+            for (const bimGeometry::Plane *plane : c)
+            {
+                bool parallel = false;
+                for (const bimGeometry::Plane *u : independent) parallel = parallel || std::abs(glm::dot(plane->normal, u->normal)) >= bimGeometry::COPLANAR_MIN_COS;
+                if (!parallel && independent.size() < 3) independent.push_back(plane);
+            }
+            glm::dvec3 q;
+            while (!independent.empty() && !ClosestPointOnPlanes(positions[x], independent, q)) independent.pop_back();
+            if (independent.empty()) continue;
+            if (!std::isfinite(q.x) || !std::isfinite(q.y) || !std::isfinite(q.z) || glm::distance(q, positions[x]) > 2 * snapDistance) continue;
+            moved[x] = q;
+        }
+
+        snapped = cutter;
+        for (uint32_t i = 0; i < snapped.numPoints; i++)
+        {
+            const glm::dvec3 &q = moved[positionOf[i]];
+            snapped.SetPoint(q.x, q.y, q.z, i);
+        }
+
+        // buildPlanes prefers the stored vertex normals over the triangle normal, so the normals of a
+        // snapped face must follow it onto the operand's plane, or the refit would tilt the face back.
+        for (auto [i, plane] : snappedFaces)
+        {
+            bimGeometry::Face f = snapped.GetFace(i);
+            for (uint32_t id : {f.i0, f.i1, f.i2})
+            {
+                double *nv = &snapped.vertexData[id * VERTEX_FORMAT_SIZE_FLOATS + 3];
+                glm::dvec3 n(nv[0], nv[1], nv[2]);
+                double length = glm::length(n);
+                if (!(length > 0)) continue;
+                double cosine = glm::dot(n, plane->normal) / length;
+                if (std::abs(cosine) < bimGeometry::COPLANAR_MIN_COS) continue;
+                glm::dvec3 m = cosine > 0 ? plane->normal : -plane->normal;
+                nv[0] = m.x;
+                nv[1] = m.y;
+                nv[2] = m.z;
+            }
+        }
+        snapped.fvertexData.clear();
+        snapped.hasPlanes = false;
+        return true;
+    }
+
     IfcGeometry booleanManager::BoolProcess(const std::vector<IfcGeometry> &firstGeoms, std::vector<IfcGeometry> &secondGeoms, std::string op, IfcGeometrySettings _settings)
     {
+        // A intersect B = A minus (A minus B). Reuse the bounded difference kernel,
+        // including its handling of transformed/multipart operands and half spaces.
+        if (op == "INTERSECTION")
+        {
+            if (firstGeoms.empty() || secondGeoms.empty()) return IfcGeometry();
+            std::vector<IfcGeometry> outside{BoolProcess(firstGeoms, secondGeoms, "DIFFERENCE", _settings)};
+            return BoolProcess(firstGeoms, outside, "DIFFERENCE", _settings);
+        }
+
         spdlog::debug("[BoolProcess({})]");
         IfcGeometry finalResult;
 
@@ -2347,17 +3024,43 @@ namespace webifc::geometry
 #endif
 
                 firstOperator.buildPlanes();
+                if (op == "DIFFERENCE")
+                {
+                    // Keep the snapped cutter only if it is still a closed solid once its planes are fitted.
+                    IfcGeometry snapped;
+                    if (SnapToOperandPlanes(firstOperator, secondOperator, bimGeometry::SNAP_TO_OPERAND_PLANE_FACTOR * _settings.TOLERANCE_PLANE_DEVIATION, snapped))
+                    {
+                        snapped.buildPlanes();
+                        if (IsClosed(snapped)) secondOperator = std::move(snapped);
+                    }
+                }
                 secondOperator.buildPlanes();
 
                 fuzzybools::SetEpsilons(_settings.TOLERANCE_PLANE_INTERSECTION, _settings.TOLERANCE_PLANE_DEVIATION, _settings.TOLERANCE_BACK_DEVIATION_DISTANCE, _settings.TOLERANCE_INSIDE_OUTSIDE_PERIMETER, _settings.TOLERANCE_BOUNDING_BOX, BOOLSTATUS);
 
-                if (op == "DIFFERENCE")
+                // Guard the CSG kernel: fuzzybools/CDT can throw on pathological
+                // operands (e.g. self-intersecting composite curves). Previously an
+                // uncaught throw here aborted the ENTIRE model load in WASM. Catch it,
+                // emit a concrete warning, and keep the un-cut first operand so the
+                // element still renders instead of taking the whole model down.
+                try
                 {
-                    firstOperator = Subtract(firstOperator, secondOperator);
+                    if (op == "DIFFERENCE")
+                    {
+                        firstOperator = Subtract(firstOperator, secondOperator);
+                    }
+                    else if (op == "UNION")
+                    {
+                        firstOperator = Union(firstOperator, secondOperator);
+                    }
                 }
-                else if (op == "UNION")
+                catch (const std::exception &e)
                 {
-                    firstOperator = Union(firstOperator, secondOperator);
+                    spdlog::error("[BoolProcess()] CSG {} threw ({}); keeping un-cut operand (faces first={}, second={})", op, e.what(), firstOperator.numFaces, secondOperator.numFaces);
+                }
+                catch (...)
+                {
+                    spdlog::error("[BoolProcess()] CSG {} threw (unknown); keeping un-cut operand (faces first={}, second={})", op, firstOperator.numFaces, secondOperator.numFaces);
                 }
 
 #ifdef CSG_DEBUG_OUTPUT

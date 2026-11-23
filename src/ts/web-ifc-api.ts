@@ -54,6 +54,10 @@ export const SET_BEGIN = 7;
 export const SET_END = 8;
 export const LINE_END = 9;
 export const INTEGER = 10;
+/** STEP binary literal contents, including the unused-bit prefix (0-3).
+ * Up to 65535 characters; lowercase hex is accepted and saved as uppercase.
+ */
+export const BINARY = 11;
 
 /**
  * Settings for the IFCLoader
@@ -71,6 +75,11 @@ export const INTEGER = 10;
  * @property {number} BOOLEAN_UNION_THRESHOLD - Minimum number of solids before triggering a boolean union operation.
  */
 export interface LoaderSettings {
+  /** Allow best-effort parsing of older/preview schemas using incompatible generated layouts.
+   * Defaults to true for backward compatibility. Set false to reject these aliases.
+   * This does not provide full support for the named schema.
+   */
+  ALLOW_INCOMPATIBLE_SCHEMA_ALIASES?: boolean;
   COORDINATE_TO_ORIGIN?: boolean;
   CIRCLE_SEGMENTS?: number;
   MEMORY_LIMIT?: number;
@@ -105,6 +114,9 @@ export interface RawLineData {
 
 export interface PlacedGeometry {
   color: Color;
+  /** False when neither the element nor any of its sub-items carries an IFC
+   * style; color is then a neutral default rather than a material. */
+  hasColor: boolean;
   geometryExpressID: number;
   flatTransformation: Array<number>;
 }
@@ -113,6 +125,13 @@ export interface FlatMesh {
   geometries: Vector<PlacedGeometry>;
   expressID: number;
   delete(): void;
+}
+
+/** A Body item the brep engine built (see IfcAPI.StreamAllBrepMeshes). */
+export interface BrepShell {
+  id: number;
+  points: Float64Array;
+  rings: Int32Array;
 }
 
 export interface Point {
@@ -413,6 +432,18 @@ export class IfcAPI {
         const modulePromise = WebIFCWasm({
           noInitialRun: true,
           locateFile: customLocateFileHandler || locateFileHandler,
+          // The generated pthread bootstrap falls back to
+          // `document.currentScript?.src` to find its own script URL when
+          // spawning its worker. That is always `undefined` when this
+          // module is loaded as an ES module (which is how `web-ifc` is
+          // distributed and how virtually every modern bundler loads it),
+          // causing `new Worker(undefined)` and a silent hang. Passing
+          // `mainScriptUrlOrBlob` explicitly (which the generated bootstrap
+          // already prefers over `document.currentScript` when present)
+          // avoids that entirely. `import.meta.url` is correctly populated
+          // for ES modules, unlike `document.currentScript`.
+          // @ts-ignore
+          ...(shouldRetrySingleThread ? { mainScriptUrlOrBlob: import.meta.url } : {}),
         });
         if (shouldRetrySingleThread) {
           this.wasmModule = await Promise.race([
@@ -476,6 +507,7 @@ export class IfcAPI {
 
   private CreateSettings(settings?: LoaderSettings) {
     let s: LoaderSettings = {
+      ALLOW_INCOMPATIBLE_SCHEMA_ALIASES: true,
       COORDINATE_TO_ORIGIN: false,
       CIRCLE_SEGMENTS: 12,
       TAPE_SIZE: 67108864,
@@ -493,11 +525,25 @@ export class IfcAPI {
     return s;
   }
 
-  private LookupSchemaId(schemaName: string) {
+  private LookupSchemaId(schemaName: string, allowIncompatibleAlias = true) {
+    const name = schemaName.toUpperCase();
     for (var i = 0; i < SchemaNames.length; i++) {
       if (typeof SchemaNames[i] !== "undefined") {
         for (var j = 0; j < SchemaNames[i].length; j++) {
-          if (SchemaNames[i][j] == schemaName.toUpperCase()) return i;
+          if (SchemaNames[i][j] === name) {
+            const canonical = SchemaNames[i][0];
+            // IFC4X3 is the generated name of the supported IFC4.3 ADD2 schema.
+            const compatible = name === canonical || name === "IFC4X3_ADD2";
+            if (!compatible) {
+              if (!allowIncompatibleAlias) {
+                Log.error(`Schema ${name} requires an incompatible ${canonical} alias. ` +
+                  "Set ALLOW_INCOMPATIBLE_SCHEMA_ALIASES to true to allow best-effort parsing.");
+                return -1;
+              }
+              Log.warn(`Parsing ${name} using ${canonical}; entity and attribute layouts may differ.`);
+            }
+            return i;
+          }
         }
       }
     }
@@ -515,17 +561,22 @@ export class IfcAPI {
     let result = this.wasmModule.OpenModel(
       s,
       (destPtr: number, offsetInSrc: number, destSize: number) => {
-        let srcSize = Math.min(data.byteLength - offsetInSrc, destSize);
+        let srcSize = Math.max(0, Math.min(data.byteLength - offsetInSrc, destSize));
         let dest = this.wasmModule.HEAPU8.subarray(destPtr, destPtr + srcSize);
         let src = data.subarray(offsetInSrc, offsetInSrc + srcSize);
         dest.set(src);
         return srcSize;
       }
     );
+    if (result < 0) return -1;
     this.deletedLines.set(result, new Set());
-    var schemaName = this.GetHeaderLine(result, FILE_SCHEMA).arguments[0][0]
-      .value;
-    let id = this.LookupSchemaId(schemaName);
+    var schemaName = this.GetHeaderLine(result, FILE_SCHEMA).arguments[0][0].value;
+    if (typeof schemaName !== "string") {
+      Log.error("Missing or invalid FILE_SCHEMA header");
+      this.CloseModel(result);
+      return -1;
+    }
+    let id = this.LookupSchemaId(schemaName, s.ALLOW_INCOMPATIBLE_SCHEMA_ALIASES);
     if (id == -1) {
       Log.error("Unsupported Schema:" + schemaName);
       this.CloseModel(result);
@@ -558,10 +609,15 @@ export class IfcAPI {
         return srcSize;
       }
     );
+    if (result < 0) return -1;
     this.deletedLines.set(result, new Set());
-    var schemaName = this.GetHeaderLine(result, FILE_SCHEMA).arguments[0][0]
-      .value;
-    this.modelSchemaList[result] = this.LookupSchemaId(schemaName);
+    var schemaName = this.GetHeaderLine(result, FILE_SCHEMA).arguments[0][0].value;
+    if (typeof schemaName !== "string") {
+      Log.error("Missing or invalid FILE_SCHEMA header");
+      this.CloseModel(result);
+      return -1;
+    }
+    this.modelSchemaList[result] = this.LookupSchemaId(schemaName, s.ALLOW_INCOMPATIBLE_SCHEMA_ALIASES);
     this.modelSchemaNameList[result] = schemaName;
     if (this.modelSchemaList[result] == -1) {
       Log.error("Unsupported Schema:" + schemaName);
@@ -589,7 +645,7 @@ export class IfcAPI {
   CreateModel(model: NewIfcModel, settings?: LoaderSettings): number {
     let s = this.CreateSettings(settings);
     let result = this.wasmModule.CreateModel(s);
-    let id = this.LookupSchemaId(model.schema);
+    let id = this.LookupSchemaId(model.schema, s.ALLOW_INCOMPATIBLE_SCHEMA_ALIASES);
     if (id == -1) {
       Log.error("Unsupported Schema:" + model.schema);
       this.CloseModel(result);
@@ -1372,25 +1428,70 @@ export class IfcAPI {
    * @param modelID Model handle retrieved by OpenModel
    * @param expressIDs expressIDs of elements to stream
    * @param meshCallback callback function that is called for each mesh
+   * @param applyLinearScalingFactor Whether to apply the model's linear scaling factor to the geometry (default: true)
    */
   StreamMeshes(
     modelID: number,
     expressIDs: Array<number>,
-    meshCallback: (mesh: FlatMesh, index: number, total: number) => void
+    meshCallback: (mesh: FlatMesh, index: number, total: number) => void,
+    applyLinearScalingFactor: boolean = true
   ) {
-    this.wasmModule.StreamMeshes(modelID, expressIDs, meshCallback);
+    this.wasmModule.StreamMeshes(modelID, expressIDs, meshCallback, applyLinearScalingFactor);
   }
 
   /**
    * Streams all meshes of a model
    * @param modelID Model handle retrieved by OpenModel
    * @param meshCallback callback function that is called for each mesh
+   * @param applyLinearScalingFactor Whether to apply the model's linear scaling factor to the geometry (default: true)
    */
   StreamAllMeshes(
     modelID: number,
-    meshCallback: (mesh: FlatMesh, index: number, total: number) => void
+    meshCallback: (mesh: FlatMesh, index: number, total: number) => void,
+    applyLinearScalingFactor: boolean = true
   ) {
-    this.wasmModule.StreamAllMeshes(modelID, meshCallback);
+    this.wasmModule.StreamAllMeshes(modelID, meshCallback, applyLinearScalingFactor);
+  }
+
+  /**
+   * As StreamAllMeshes, with the brep kernel as the geometry engine (builds with BREP_ENGINE only).
+   * Each Body item the kernel builds comes as a shell instead of a mesh: its geometry in `mesh` has no
+   * vertices, and `shells` holds `{ id, points, rings }` for it -- points in file units, in the frame
+   * the geometry's flatTransformation places; `rings` per face: ring count, then each ring's length
+   * and point indices, the first ring the outer one. The arrays view wasm memory and are valid
+   * during the callback only. Anything the kernel does not build comes as an ordinary mesh.
+   */
+  StreamAllBrepMeshes(
+    modelID: number,
+    meshCallback: (mesh: FlatMesh, shells: BrepShell[], index: number, total: number) => void
+  ) {
+    if (!this.wasmModule.StreamAllBrepMeshes) throw new Error("web-ifc: this build has no brep engine");
+    this.wasmModule.StreamAllBrepMeshes(modelID, meshCallback);
+  }
+
+  /** As StreamMeshes, with the brep kernel as the geometry engine. See StreamAllBrepMeshes. */
+  StreamBrepMeshes(
+    modelID: number,
+    expressIDs: Array<number>,
+    meshCallback: (mesh: FlatMesh, shells: BrepShell[], index: number, total: number) => void
+  ) {
+    if (!this.wasmModule.StreamBrepMeshes) throw new Error("web-ifc: this build has no brep engine");
+    this.wasmModule.StreamBrepMeshes(modelID, expressIDs, meshCallback);
+  }
+
+  /** Whether this build carries the brep geometry engine. */
+  HasBrepEngine(): boolean {
+    return !!this.wasmModule?.StreamAllBrepMeshes;
+  }
+
+  /**
+   * The brep engine on booleans only: Body items that are IfcBooleanResult / IfcBooleanClippingResult
+   * (or belong to a product with openings) go to the brep kernel, everything else is meshed by
+   * web-ifc as with StreamMeshes, keeping its shared geometries.
+   */
+  SetBrepBooleansOnly(modelID: number, on: boolean) {
+    if (!this.wasmModule.SetBrepBooleansOnly) throw new Error("web-ifc: this build has no brep engine");
+    this.wasmModule.SetBrepBooleansOnly(modelID, on);
   }
 
   /**
@@ -1398,13 +1499,15 @@ export class IfcAPI {
    * @param modelID Model handle retrieved by OpenModel
    * @param types types of elements to stream
    * @param meshCallback callback function that is called for each mesh
+   * @param applyLinearScalingFactor Whether to apply the model's linear scaling factor to the geometry (default: true)
    */
   StreamAllMeshesWithTypes(
     modelID: number,
     types: Array<number>,
-    meshCallback: (mesh: FlatMesh, index: number, total: number) => void
+    meshCallback: (mesh: FlatMesh, index: number, total: number) => void,
+    applyLinearScalingFactor: boolean = true
   ) {
-    this.wasmModule.StreamAllMeshesWithTypes(modelID, types, meshCallback);
+    this.wasmModule.StreamAllMeshesWithTypes(modelID, types, meshCallback, applyLinearScalingFactor);
   }
 
   /**
@@ -1419,10 +1522,11 @@ export class IfcAPI {
   /**
    * Load all geometry in a model
    * @param modelID Model handle retrieved by OpenModel
+   * @param applyLinearScalingFactor Whether to apply the model's linear scaling factor to the geometry (default: true)
    * @returns Vector of FlatMesh objects
    */
-  LoadAllGeometry(modelID: number): Vector<FlatMesh> {
-    let flatMeshes = this.wasmModule.LoadAllGeometry(modelID);
+  LoadAllGeometry(modelID: number, applyLinearScalingFactor: boolean = true): Vector<FlatMesh> {
+    let flatMeshes = this.wasmModule.LoadAllGeometry(modelID, applyLinearScalingFactor);
     flatMeshes[Symbol.iterator] = function* () {
       for (let i = 0; i < flatMeshes.size(); i++) yield flatMeshes.get(i);
     };
@@ -1433,10 +1537,11 @@ export class IfcAPI {
    * Load geometry for a single element
    * @param modelID Model handle retrieved by OpenModel
    * @param expressID ExpressID of the element
+   * @param applyLinearScalingFactor Whether to apply the model's linear scaling factor to the geometry (default: true)
    * @returns FlatMesh object
    */
-  GetFlatMesh(modelID: number, expressID: number): FlatMesh {
-    return this.wasmModule.GetFlatMesh(modelID, expressID);
+  GetFlatMesh(modelID: number, expressID: number, applyLinearScalingFactor: boolean = true): FlatMesh {
+    return this.wasmModule.GetFlatMesh(modelID, expressID, applyLinearScalingFactor);
   }
 
   /**
@@ -1496,20 +1601,26 @@ export class IfcAPI {
     let entities = this.GetIfcEntityList(modelID);
     for (const typeId of entities) {
       if (!this.IsIfcElement(typeId)) continue;
-      const lines = this.GetLineIDsWithType(modelID, typeId);
-      const size = lines.size();
-      for (let y = 0; y < size; y++) {
-        const expressID = lines.get(y);
-        const info = this.GetLine(modelID, expressID);
-        try {
-          if ("GlobalId" in info) {
-            const globalID = info.GlobalId.value;
-            map.set(expressID, globalID);
-            map.set(globalID, expressID);
+      const lines = this.GetLineIDsWithType(modelID, typeId) as Vector<number> & {
+        delete(): void;
+      };
+      try {
+        const size = lines.size();
+        for (let y = 0; y < size; y++) {
+          const expressID = lines.get(y);
+          const info = this.GetLine(modelID, expressID);
+          try {
+            if ("GlobalId" in info) {
+              const globalID = info.GlobalId.value;
+              map.set(expressID, globalID);
+              map.set(globalID, expressID);
+            }
+          } catch (e) {
+            continue;
           }
-        } catch (e) {
-          continue;
         }
+      } finally {
+        lines.delete();
       }
     }
     this.ifcGuidMap.set(modelID, map);

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <limits>
 #include <optional>
 #include <string_view>
 #include <cstdio>
@@ -124,6 +125,11 @@ namespace webifc::geometry {
 			double VDegree = 0;
 			bool ClosedU = false;
 			bool ClosedV = false;
+			// IfcFaceSurface.SameSense: TRUE when the face's outward side agrees
+			// with the surface normal dS/du x dS/dv, FALSE when it is reversed.
+			// Defaults to TRUE — the value every stored face had before this
+			// field existed (export wrote a fixed .T.).
+			bool SameSense = true;
 			// Control net, row-major [u][v]. `Weights` is parallel to it when
 			// the surface is rational, and EMPTY when it is not — the two cases
 			// re-export as different IFC entities, so the distinction is kept.
@@ -168,11 +174,61 @@ namespace webifc::geometry {
 			glm::dvec3 Direction;
 			IfcProfile Profile;
 			double Length;
+			// Open directrix kept in its swept direction. Profile.curve is normalized to CCW by GetProfile, which
+			// reverses it, so the surface normal is derived from this curve instead.
+			IfcCurve SweptCurve;
+
+			// Unit normal C'(u) x D of the surface S(u, v) = C(u) + v * D, taken at the curve segment closest to `point`
+			// (in the parent frame; `placement` maps surface-local to parent). Returns zero if undefined.
+			glm::dvec3 NormalAt(const glm::dmat4 &placement, const glm::dvec3 &point) const
+			{
+				const auto &pts = SweptCurve.points;
+				if (pts.size() < 2 || glm::length(Direction) == 0)
+				{
+					return glm::dvec3(0);
+				}
+
+				const glm::dvec3 d = glm::normalize(Direction);
+				// Distances are measured across the extrusion direction
+				auto across = [&](const glm::dvec3 &v)
+				{ return v - d * glm::dot(v, d); };
+				const glm::dvec3 q = across(glm::dvec3(glm::inverse(placement) * glm::dvec4(point, 1.0)));
+
+				double bestDist2 = std::numeric_limits<double>::infinity();
+				glm::dvec3 tangent(0);
+				for (size_t i = 0; i + 1 < pts.size(); i++)
+				{
+					const glm::dvec3 segment = pts[i + 1] - pts[i];
+					if (glm::length(segment) == 0)
+					{
+						continue;
+					}
+					const glm::dvec3 a = across(pts[i]);
+					const glm::dvec3 ab = across(pts[i + 1]) - a;
+					const double len2 = glm::dot(ab, ab);
+					const double t = len2 > 0 ? glm::clamp(glm::dot(q - a, ab) / len2, 0.0, 1.0) : 0.0;
+					const glm::dvec3 offset = q - (a + ab * t);
+					const double dist2 = glm::dot(offset, offset);
+					if (dist2 < bestDist2)
+					{
+						bestDist2 = dist2;
+						tangent = segment;
+					}
+				}
+
+				const glm::dvec3 n = glm::cross(tangent, d);
+				if (glm::length(n) == 0)
+				{
+					return glm::dvec3(0);
+				}
+				return glm::normalize(glm::dvec3(placement * glm::dvec4(n, 0.0)));
+			}
 		};
 
 		struct IfcCrossSections
 		{
 			std::vector<IfcCurve> curves;
+            std::vector<std::vector<IfcCurve>> holes;
 			std::vector<uint32_t> expressID;
 		};
 
@@ -237,6 +293,10 @@ namespace webifc::geometry {
 		struct IfcPlacedGeometry
 		{
 			glm::dvec4 color;
+			// false when neither the element nor any of its sub-items carries an
+			// IFC style; color is then a neutral default and must not be
+			// interpreted as a material definition
+			bool hasColor = false;
 			glm::dmat4 transformation;
 			std::array<double, 16> flatTransformation;
 			uint32_t geometryExpressID;
@@ -392,6 +452,12 @@ namespace webifc::geometry {
 					}
 					return glm::dvec3(0);
 				}
+			}
+
+			// Normal at the surface point nearest `point`. Unlike normal(), it varies along an extrusion surface.
+			glm::dvec3 normalAt(const glm::dvec3 &point)
+			{
+				return ExtrusionSurface.Active ? ExtrusionSurface.NormalAt(transformation, point) : normal();
 			}
 		};
 	}

@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.   */
 
 #include <spdlog/spdlog.h>
+#include <algorithm>
 #include "IfcCache.h"
 
 namespace webifc::cache
@@ -61,22 +62,55 @@ namespace webifc::cache
 
       uint32_t relatingBuildingElement = _loader.GetRefArgument();
       auto aggregates = _loader.GetSetArgument();
-      auto relVoidsIt2 = _relVoids.find(relatingBuildingElement);
 
       for (auto &aggregate : aggregates)
       {
         uint32_t aggregateID = _loader.GetRefArgument(aggregate);
         resultVector[relatingBuildingElement].push_back(aggregateID);
-        if (relVoidsIt2 != _relVoids.end() && !relVoidsIt2->second.empty())
+      }
+    }
+
+    // Propagate voids from an aggregating element down through the whole
+    // (possibly nested) aggregate hierarchy. This must reach a fixed point
+    // because the aggregate definitions are not guaranteed to be ordered
+    // such that a parent's voids are known before its children are processed.
+    bool changed = true;
+    while (changed)
+    {
+      changed = false;
+      for (auto &aggregatePair : resultVector)
+      {
+        auto relVoidsIt2 = _relVoids.find(aggregatePair.first);
+        if (relVoidsIt2 == _relVoids.end() || relVoidsIt2->second.empty())
+        {
+          continue;
+        }
+        // Copy the parent's voids up front so we never dereference a map
+        // iterator in _relVoids after a rehash-triggering insertion below.
+        std::vector<uint32_t> parentVoidIDs = relVoidsIt2->second;
+        for (uint32_t aggregateID : aggregatePair.second)
         {
           auto relVoidsIt1 = _relVoids.find(aggregateID);
-          // any any voids that are aggregated to the voids map
           if (relVoidsIt1 == _relVoids.end())
           {
-            _relVoids[aggregateID] = std::vector<uint32_t>();
-            relVoidsIt1 = _relVoids.find(aggregateID);
+            _relVoids[aggregateID] = parentVoidIDs;
+            changed = true;
           }
-          relVoidsIt1->second.insert(relVoidsIt1->second.end(), relVoidsIt2->second.begin(), relVoidsIt2->second.end());
+          else
+          {
+            // Only add voids that are not already present to avoid infinite loops
+            std::vector<uint32_t> &existing = relVoidsIt1->second;
+            bool anyNew = false;
+            for (uint32_t relVoidExpressID : parentVoidIDs)
+            {
+              if (std::find(existing.begin(), existing.end(), relVoidExpressID) == existing.end())
+              {
+                existing.push_back(relVoidExpressID);
+                anyNew = true;
+              }
+            }
+            changed = changed || anyNew;
+          }
         }
       }
     }
@@ -151,6 +185,32 @@ namespace webifc::cache
         resultVector[ifcRootID].emplace_back(styledItemID, materialSelect);
       }
     }
+
+    // an occurrence without its own material uses its type's material (IfcRelAssociatesMaterial)
+    ankerl::unordered_dense::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> typeMaterials;
+    auto relTypes = _loader.GetExpressIDsWithType(schema::IFCRELDEFINESBYTYPE);
+
+    for (uint32_t relTypeID : relTypes)
+    {
+      _loader.MoveToArgumentOffset(relTypeID, 5);
+
+      uint32_t relatingType = _loader.GetRefArgument();
+      auto typeMaterial = resultVector.find(relatingType);
+      if (typeMaterial == resultVector.end())
+        continue;
+
+      _loader.MoveToArgumentOffset(relTypeID, 4);
+
+      auto RelatedObjects = _loader.GetSetArgument();
+
+      for (auto &ifcRoot : RelatedObjects)
+      {
+        uint32_t ifcRootID = _loader.GetRefArgument(ifcRoot);
+        if (resultVector.count(ifcRootID) == 0)
+          typeMaterials[ifcRootID] = typeMaterial->second;
+      }
+    }
+    resultVector.insert(typeMaterials.begin(), typeMaterials.end());
     return resultVector;
   }
 
@@ -248,6 +308,12 @@ namespace webifc::cache
         std::string_view unitType = _loader.GetStringArgument();
         _loader.MoveToArgumentOffset(unitRef, 3);
         auto unitRefLine = _loader.GetRefArgument();
+        // Dangling reference (#2332): MoveToArgumentOffset would leave the cursor at a stale position
+        if (!_loader.IsValidExpressID(unitRefLine))
+        {
+          spdlog::error("[ReadLinearScalingFactor()] conversion unit references missing line #{}", unitRefLine);
+          continue;
+        }
 
         _loader.MoveToArgumentOffset(unitRefLine, 1);
         auto ratios = _loader.GetSetArgument();
@@ -256,6 +322,11 @@ namespace webifc::cache
 
         _loader.MoveToArgumentOffset(unitRefLine, 2);
         auto scaleRefLine = _loader.GetRefArgument();
+        if (!_loader.IsValidExpressID(scaleRefLine) || ratios.empty())
+        {
+          spdlog::error("[ReadLinearScalingFactor()] conversion unit has no valid ratio or scale reference #{}", unitRefLine);
+          continue;
+        }
 
         _loader.MoveToArgumentOffset(scaleRefLine, 1);
         std::string_view unitTypeScale = _loader.GetStringArgument();
@@ -303,40 +374,39 @@ namespace webifc::cache
   {
     if (prefix == "")
       return 1;
-    else if (prefix == "EXA")
+    if (prefix == "EXA")
       return 1e18;
-    else if (prefix == "PETA")
+    if (prefix == "PETA")
       return 1e15;
-    else if (prefix == "TERA")
+    if (prefix == "TERA")
       return 1e12;
-    else if (prefix == "GIGA")
+    if (prefix == "GIGA")
       return 1e9;
-    else if (prefix == "MEGA")
+    if (prefix == "MEGA")
       return 1e6;
-    else if (prefix == "KILO")
+    if (prefix == "KILO")
       return 1e3;
-    else if (prefix == "HECTO")
+    if (prefix == "HECTO")
       return 1e2;
-    else if (prefix == "DECA")
+    if (prefix == "DECA")
       return 10;
-    else if (prefix == "DECI")
+    if (prefix == "DECI")
       return 1e-1;
-    else if (prefix == "CENTI")
+    if (prefix == "CENTI")
       return 1e-2;
-    else if (prefix == "MILLI")
+    if (prefix == "MILLI")
       return 1e-3;
-    else if (prefix == "MICRO")
+    if (prefix == "MICRO")
       return 1e-6;
-    else if (prefix == "NANO")
+    if (prefix == "NANO")
       return 1e-9;
-    else if (prefix == "PICO")
+    if (prefix == "PICO")
       return 1e-12;
-    else if (prefix == "FEMTO")
+    if (prefix == "FEMTO")
       return 1e-15;
-    else if (prefix == "ATTO")
+    if (prefix == "ATTO")
       return 1e-18;
-    else
-      return 1;
+    return 1;
   }
 
   const ankerl::unordered_dense::map<uint32_t, std::vector<uint32_t>> &IfcCache::GetRelVoids() const
