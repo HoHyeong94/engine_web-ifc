@@ -119,14 +119,23 @@ namespace
             if (row.size() != n_v)
                 return false;
 
+        // The rational weights. `BSpline` has TWO weight fields and the loader
+        // fills only `WeightPoints` (IFCRATIONALBSPLINESURFACEWITHKNOTS,
+        // WeightsData); `Weights` is never written by any reader, so taking it
+        // stored every rational surface as NON-rational and re-exported it as
+        // a plain IFCBSPLINESURFACEWITHKNOTS — a different, wrong shape
+        // whenever a weight is not 1. `Weights` stays as the fallback so this
+        // keeps working if upstream ever moves the loader onto that field.
+        const auto &weights = b.WeightPoints.empty() ? b.Weights : b.WeightPoints;
+
         // Weights are either absent (non-rational) or a net-shaped grid.
         // Anything else would be carried across as "non-rational" and
         // re-export as the wrong IFC entity, so it is tessellated instead.
-        if (!b.Weights.empty())
+        if (!weights.empty())
         {
-            if (b.Weights.size() != n_u)
+            if (weights.size() != n_u)
                 return false;
-            for (const auto &row : b.Weights)
+            for (const auto &row : weights)
                 if (row.size() != n_v)
                     return false;
         }
@@ -152,7 +161,7 @@ namespace
         f.ClosedV = (b.ClosedV == "T" || b.ClosedV == ".T.");
         f.SameSense = sameSense;
         f.ControlPoints = b.ControlPoints;
-        f.Weights = b.Weights;
+        f.Weights = weights;
         f.UMultiplicity = b.UMultiplicity;
         f.VMultiplicity = b.VMultiplicity;
         f.UKnots = b.UKnots;
