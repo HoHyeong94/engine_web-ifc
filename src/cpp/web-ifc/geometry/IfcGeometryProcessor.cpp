@@ -246,6 +246,14 @@ namespace webifc::geometry
         std::unordered_map<uint32_t, IfcGeometry>().swap(_expressIDToGeometry);
         _cache.Clear();
     }
+    // gvcs-ifc: `isRelative` returns the ONE-HOP placement (GetRelativePlacement:
+    // the node's own RelativePlacement, every ancestor dropped), NOT a world
+    // matrix. That is the value the relative-placement mode hands out, and the
+    // one that has bitten twice: the streamed flat-mesh top transform (the
+    // wrapper now overwrites it with the full chain) and the IfcRelVoidsElement
+    // boolean (openings re-framed in GetMeshUncached). Pass `false` — or compose
+    // the ancestors — wherever a world placement is meant. No gvcs-ifc caller
+    // uses the relative form today.
     std::array<double, 16> IfcGeometryProcessor::GetFlatSpatialNodeMatrix(uint32_t expressID, bool isRelative)
     {
         std::array<double, 16> flatTransformation;
