@@ -205,6 +205,20 @@ namespace webifc::geometry
 					}
 				}
 			}
+			// gvcs-ifc: the retained NURBS faces live in the same space as the
+			// baked vertices, so they take the same shift. The returned matrix
+			// adds `center` back for BOTH; leaving the faces unshifted placed
+			// every B-spline surface `center` away from the rest of its brep
+			// (measured 1.0-2.2 m on the two_towers Facade).
+			for (auto &f : nurbsFaces)
+			{
+				for (auto &row : f.ControlPoints)
+					for (auto &p : row)
+						p -= center;
+				for (auto &bd : f.Bounds)
+					for (auto &p : bd.Points)
+						p -= center;
+			}
 			normalizationCenter = center;
 			normalized = true;
 		}
