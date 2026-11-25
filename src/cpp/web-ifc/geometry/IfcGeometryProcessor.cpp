@@ -500,10 +500,48 @@ namespace webifc::geometry
 
                 std::vector<IfcGeometry> voidGeoms;
 
+                // gvcs-ifc: under relative placement GetMesh gives every
+                // element its ONE-HOP placement — the host relative to ITS
+                // parent, and the opening relative to ITS parent, which is
+                // normally the host itself. Subtracting those as-is drops the
+                // host's own placement from the opening, so the void lands
+                // somewhere else and cuts nothing (two_towers Facade: 0 of 735
+                // hosts cut). Re-express each opening from its FULL placement
+                // chain in the frame the host's one-hop transform lives in:
+                //   hostRel * inverse(hostAbs) * openingAbs
+                // Exact whatever the opening is placed relative to (host,
+                // storey, an aggregate parent). Absolute mode already has both
+                // in world and is untouched.
+                glm::dmat4 openingFrame(1);
+                if (_useRelativePlacement)
+                {
+                    glm::dmat4 hostAbs(1);
+                    if (localPlacement != 0 && _loader.IsValidExpressID(localPlacement))
+                    {
+                        hostAbs = _geometryLoader.GetLocalPlacement(localPlacement);
+                    }
+                    openingFrame = mesh.transformation * glm::inverse(hostAbs);
+                }
+
                 for (auto relVoidExpressID : relVoidsIt->second)
                 {
 
                     IfcComposedMesh voidGeom = GetMesh(relVoidExpressID);
+                    if (_useRelativePlacement)
+                    {
+                        glm::dmat4 openingAbs(1);
+                        _loader.MoveToArgumentOffset(relVoidExpressID, 5); // IfcProduct.ObjectPlacement
+                        if (_loader.GetTokenType() == parsing::IfcTokenType::REF)
+                        {
+                            _loader.StepBack();
+                            uint32_t openingPlacement = _loader.GetRefArgument();
+                            if (openingPlacement != 0 && _loader.IsValidExpressID(openingPlacement))
+                            {
+                                openingAbs = _geometryLoader.GetLocalPlacement(openingPlacement);
+                            }
+                        }
+                        voidGeom.transformation = openingFrame * openingAbs;
+                    }
                     auto flatVoidMesh = flatten(voidGeom, _expressIDToGeometry, normalizeMat);
                     voidGeoms.insert(voidGeoms.end(), flatVoidMesh.begin(), flatVoidMesh.end());
                 }
